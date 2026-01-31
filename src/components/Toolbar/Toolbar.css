@@ -1,0 +1,123 @@
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: 20px;
+  padding: 8px 16px;
+  background: var(--bg-secondary);
+  border-bottom: 1px solid var(--border);
+}
+
+.toolbar-title {
+  font-weight: 600;
+  font-size: 16px;
+  color: var(--accent);
+}
+
+.toolbar-section {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.toolbar-tools {
+  flex: 1;
+  justify-content: center;
+}
+
+.tool-button {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 6px 12px;
+  min-width: 60px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 6px;
+}
+
+.tool-button:hover {
+  background: var(--bg-tertiary);
+}
+
+.tool-button.active {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+.tool-icon {
+  font-size: 18px;
+  margin-bottom: 2px;
+}
+
+.tool-label {
+  font-size: 10px;
+  color: var(--text-secondary);
+}
+
+.tool-button.active .tool-label {
+  color: var(--text-primary);
+}
+
+.action-button {
+  padding: 8px 16px;
+  font-weight: 500;
+}
+
+.action-button.solve {
+  background: var(--success);
+  color: #000;
+}
+
+.action-button.solve:hover {
+  background: #22c55e;
+}
+
+.action-button.danger {
+  background: transparent;
+  border: 1px solid var(--accent);
+  color: var(--accent);
+}
+
+.action-button.danger:hover {
+  background: var(--accent);
+  color: var(--text-primary);
+}
+
+.toolbar-label {
+  font-size: 12px;
+  color: var(--text-secondary);
+  margin-right: 4px;
+}
+
+.toolbar-select {
+  padding: 4px 8px;
+  font-size: 12px;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text-primary);
+}
+
+.diagram-buttons {
+  display: flex;
+  gap: 2px;
+}
+
+.diagram-button {
+  padding: 4px 8px;
+  font-size: 11px;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text-secondary);
+}
+
+.diagram-button:hover {
+  background: var(--bg-primary);
+}
+
+.diagram-button.active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--text-primary);
+}

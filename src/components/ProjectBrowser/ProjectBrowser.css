@@ -1,0 +1,326 @@
+.project-browser {
+  width: 260px;
+  background: var(--bg-primary);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.browser-header {
+  padding: 12px 16px;
+  background: linear-gradient(to bottom, var(--bg-tertiary), var(--bg-secondary));
+  border-bottom: 1px solid var(--border-light);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.browser-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-primary);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.project-info-btn {
+  background: transparent;
+  border: 1px solid var(--border-light);
+  border-radius: 4px;
+  color: var(--text-muted);
+  cursor: pointer;
+  padding: 3px 5px;
+  display: flex;
+  align-items: center;
+  transition: all 0.15s ease;
+}
+
+.project-info-btn:hover {
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+  border-color: var(--accent);
+}
+
+/* Project Information Panel */
+.project-info-panel {
+  padding: 8px 16px;
+  background: var(--bg-secondary);
+  border-bottom: 1px solid var(--border);
+}
+
+.project-info-row {
+  display: flex;
+  justify-content: space-between;
+  padding: 3px 0;
+  font-size: 11px;
+}
+
+.project-info-label {
+  color: var(--text-muted);
+  font-weight: 500;
+}
+
+.project-info-value {
+  color: var(--text-primary);
+  font-family: monospace;
+  font-size: 10px;
+}
+
+/* Browser horizontal tabs */
+.browser-tabs {
+  display: flex;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-secondary);
+}
+
+.browser-tab {
+  flex: 1;
+  padding: 8px 0;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text-muted);
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.browser-tab:hover {
+  color: var(--text-secondary);
+  background: var(--accent-subtle);
+}
+
+.browser-tab.active {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+}
+
+/* Results LC Selector */
+.results-lc-selector {
+  padding: 8px 16px;
+  background: var(--bg-secondary);
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.results-lc-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  white-space: nowrap;
+}
+
+.results-lc-select {
+  flex: 1;
+  padding: 4px 6px;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-light);
+  border-radius: 4px;
+  color: var(--text-primary);
+  font-size: 11px;
+}
+
+.results-lc-select:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+/* Diagram scale slider */
+.results-scale-row {
+  padding: 8px 16px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.results-scale-row input[type="range"] {
+  flex: 1;
+}
+
+.results-scale-value {
+  font-family: monospace;
+  font-size: 10px;
+  color: var(--text-secondary);
+  min-width: 24px;
+  text-align: right;
+}
+
+/* Results empty state */
+.results-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 40px 20px;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.results-empty-hint {
+  font-size: 10px;
+  opacity: 0.6;
+}
+
+.browser-tree {
+  flex: 1;
+  overflow-y: auto;
+  padding: 8px 0;
+}
+
+.tree-section {
+  margin-bottom: 4px;
+}
+
+.tree-item {
+  display: flex;
+  align-items: center;
+  padding: 7px 12px;
+  cursor: pointer;
+  color: var(--text-secondary);
+  font-size: 12px;
+  transition: background 0.1s ease;
+  gap: 6px;
+}
+
+.tree-item:hover {
+  background: var(--accent-subtle);
+}
+
+.tree-item.root {
+  color: var(--text-primary);
+  font-weight: 500;
+}
+
+.tree-item.leaf {
+  padding-left: 36px;
+}
+
+.tree-item.selected {
+  background: var(--accent);
+  color: #fff;
+  border-left: 2px solid var(--accent);
+}
+
+.tree-item.result-option {
+  cursor: pointer;
+}
+
+.tree-item.active-result {
+  background: var(--accent-subtle);
+  color: var(--text-primary);
+  border-left: 2px solid var(--accent);
+  font-weight: 500;
+}
+
+.tree-children {
+  margin-left: 8px;
+}
+
+.tree-arrow {
+  width: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-muted);
+  transition: transform 0.15s ease;
+  flex-shrink: 0;
+}
+
+.tree-arrow.expanded {
+  transform: rotate(90deg);
+}
+
+.tree-icon {
+  width: 16px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.tree-icon.small {
+  width: 14px;
+}
+
+.tree-label {
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tree-count {
+  font-size: 10px;
+  color: var(--text-muted);
+  background: var(--bg-tertiary);
+  padding: 2px 6px;
+  border-radius: 10px;
+  margin-left: auto;
+}
+
+.tree-info {
+  font-size: 10px;
+  color: var(--text-muted);
+  margin-left: auto;
+  white-space: nowrap;
+}
+
+/* Scrollbar styling */
+.browser-tree::-webkit-scrollbar {
+  width: 8px;
+}
+
+.browser-tree::-webkit-scrollbar-track {
+  background: var(--bg-primary);
+}
+
+.browser-tree::-webkit-scrollbar-thumb {
+  background: var(--bg-tertiary);
+  border-radius: 4px;
+}
+
+.browser-tree::-webkit-scrollbar-thumb:hover {
+  background: var(--bg-elevated);
+}
+
+.project-browser.collapsed-panel {
+  width: 28px;
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 8px 0;
+}
+
+.project-browser.collapsed-panel:hover {
+  background: var(--bg-secondary);
+}
+
+.browser-collapse-btn {
+  background: transparent;
+  border: 1px solid var(--border-light);
+  border-radius: 4px;
+  color: var(--text-muted);
+  cursor: pointer;
+  padding: 2px 4px;
+  display: flex;
+  align-items: center;
+  transition: all 0.15s ease;
+}
+
+.browser-collapse-btn:hover {
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+}

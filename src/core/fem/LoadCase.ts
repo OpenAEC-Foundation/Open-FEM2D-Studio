@@ -1,0 +1,129 @@
+/**
+ * Load Case and Load Combination definitions
+ */
+
+export interface IPointLoad {
+  nodeId: number;
+  fx: number;      // N
+  fy: number;      // N
+  mz: number;      // Nm
+}
+
+export interface IDistributedLoad {
+  elementId: number;
+  qx: number;      // N/m (local)
+  qy: number;      // N/m (local)
+}
+
+export interface ILoadCase {
+  id: number;
+  name: string;
+  type: 'dead' | 'live' | 'wind' | 'snow' | 'other';
+  pointLoads: IPointLoad[];
+  distributedLoads: IDistributedLoad[];
+  color: string;
+}
+
+export interface ILoadCombination {
+  id: number;
+  name: string;
+  factors: Map<number, number>;  // loadCaseId -> factor
+  type: 'ULS' | 'SLS';
+}
+
+export const DEFAULT_LOAD_CASES: ILoadCase[] = [
+  {
+    id: 1,
+    name: 'Dead Load (G)',
+    type: 'dead',
+    pointLoads: [],
+    distributedLoads: [],
+    color: '#6b7280'
+  },
+  {
+    id: 2,
+    name: 'Live Load (Q)',
+    type: 'live',
+    pointLoads: [],
+    distributedLoads: [],
+    color: '#3b82f6'
+  },
+  {
+    id: 3,
+    name: 'Wind Load (W)',
+    type: 'wind',
+    pointLoads: [],
+    distributedLoads: [],
+    color: '#22c55e'
+  }
+];
+
+export function createLoadCase(
+  id: number,
+  name: string,
+  type: ILoadCase['type'] = 'other'
+): ILoadCase {
+  const colors: Record<ILoadCase['type'], string> = {
+    dead: '#6b7280',
+    live: '#3b82f6',
+    wind: '#22c55e',
+    snow: '#06b6d4',
+    other: '#f59e0b'
+  };
+
+  return {
+    id,
+    name,
+    type,
+    pointLoads: [],
+    distributedLoads: [],
+    color: colors[type]
+  };
+}
+
+export function createLoadCombination(
+  id: number,
+  name: string,
+  type: 'ULS' | 'SLS' = 'ULS'
+): ILoadCombination {
+  return {
+    id,
+    name,
+    factors: new Map(),
+    type
+  };
+}
+
+// Standard Eurocode combinations
+export function getEurocodeULSFactors(loadCases: ILoadCase[]): Map<number, number> {
+  const factors = new Map<number, number>();
+
+  for (const lc of loadCases) {
+    switch (lc.type) {
+      case 'dead':
+        factors.set(lc.id, 1.35);
+        break;
+      case 'live':
+        factors.set(lc.id, 1.5);
+        break;
+      case 'wind':
+      case 'snow':
+        factors.set(lc.id, 1.5);
+        break;
+      default:
+        factors.set(lc.id, 1.5);
+    }
+  }
+
+  return factors;
+}
+
+export function getEurocodeSLSFactors(loadCases: ILoadCase[]): Map<number, number> {
+  const factors = new Map<number, number>();
+
+  for (const lc of loadCases) {
+    factors.set(lc.id, 1.0);
+  }
+
+  return factors;
+}

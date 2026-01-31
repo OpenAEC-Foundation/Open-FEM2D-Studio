@@ -1,0 +1,44 @@
+.status-bar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 6px 16px;
+  background: var(--bg-secondary);
+  border-top: 1px solid var(--border);
+  font-size: 12px;
+}
+
+.status-section {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.status-label {
+  color: var(--text-secondary);
+}
+
+.status-hint {
+  color: var(--text-primary);
+}
+
+.status-stats {
+  gap: 20px;
+}
+
+.status-stats span {
+  color: var(--text-secondary);
+}
+
+.status-stats strong {
+  color: var(--text-primary);
+  font-weight: 500;
+}
+
+.status-solved {
+  color: var(--success) !important;
+  font-weight: 500 !important;
+  padding: 2px 8px;
+  background: rgba(74, 222, 128, 0.1);
+  border-radius: 3px;
+}
