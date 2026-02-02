@@ -19,6 +19,9 @@
 }
 
 .proj-info-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
   padding: 12px 16px;
   font-size: 13px;
   font-weight: 600;
@@ -26,6 +29,106 @@
   border-bottom: 1px solid var(--border);
   background: var(--bg-secondary);
   border-radius: 8px 8px 0 0;
+}
+
+.proj-info-erp-btn {
+  padding: 3px 10px;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-light);
+  border-radius: 4px;
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.proj-info-erp-btn:hover {
+  background: var(--accent-subtle);
+  border-color: var(--accent);
+}
+
+.erp-search-section {
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-dark);
+}
+
+.erp-search-row {
+  display: flex;
+  gap: 6px;
+}
+
+.erp-search-row input {
+  flex: 1;
+  padding: 5px 8px;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-light);
+  border-radius: 4px;
+  color: var(--text-primary);
+  font-size: 12px;
+}
+
+.erp-search-row input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.erp-search-row button {
+  padding: 5px 12px;
+  background: var(--accent);
+  border: none;
+  border-radius: 4px;
+  color: #fff;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.erp-search-row button:disabled {
+  opacity: 0.5;
+}
+
+.erp-error {
+  color: var(--danger);
+  font-size: 11px;
+  margin-top: 6px;
+}
+
+.erp-results {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: 8px;
+  max-height: 150px;
+  overflow-y: auto;
+}
+
+.erp-result-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 6px 8px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text-primary);
+  font-size: 11px;
+  cursor: pointer;
+  text-align: left;
+}
+
+.erp-result-item:hover {
+  background: var(--accent-subtle);
+  border-color: var(--accent);
+}
+
+.erp-result-name {
+  font-weight: 600;
+}
+
+.erp-result-meta {
+  color: var(--text-muted);
+  font-size: 10px;
 }
 
 .proj-info-body {

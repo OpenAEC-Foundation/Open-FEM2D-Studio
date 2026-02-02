@@ -2,23 +2,28 @@ import { useState } from 'react';
 import { useFEM } from '../../context/FEMContext';
 import { applyLoadCaseToMesh } from '../../context/FEMContext';
 import { Tool, AnalysisType } from '../../core/fem/types';
-import { solveNonlinear } from '../../core/solver/NonlinearSolver';
+import { solve } from '../../core/solver/SolverService';
 import { runAllVerificationTests, printVerificationReport } from '../../core/solver/VerificationTests';
 import { exportToIfc, downloadIfc } from '../../core/export/IfcExporter';
+import { downloadReport } from '../../core/export/ReportGenerator';
+import { STEEL_GRADES } from '../../core/standards/EurocodeNL';
+import { checkSteelSection } from '../../core/standards/SteelCheck';
+import { calculateBeamLength } from '../../core/fem/Beam';
 import {
   MousePointer2, Hand, Minus, CircleDot,
   Triangle, ArrowLeftFromLine, Circle, ArrowDownUp, RotateCcw, ArrowLeftRight, Square,
-  ArrowDown, Trash2, Move,
-  Play, FastForward, CheckCircle, GripVertical,
+  ArrowDown, Trash2, Move, Thermometer,
+  Play, FastForward, CheckCircle,
   BarChart3, FileText, Copy,
   Undo2, Redo2, Layers, Combine,
-  Settings, Info, Download, Save, FolderOpen, Grid3X3, Bot
+  Settings, Info, Download, Save, FolderOpen, Grid3X3, Bot, Box
 } from 'lucide-react';
 import { serializeProject } from '../../core/io/ProjectSerializer';
 import { deserializeProject } from '../../core/io/ProjectSerializer';
+import { Mesh } from '../../core/fem/Mesh';
 import './Ribbon.css';
 
-type RibbonTab = 'home' | 'settings' | 'standards';
+type RibbonTab = 'home' | 'settings' | 'standards' | '3d' | 'results' | 'code-check';
 
 interface RibbonProps {
   onShowLoadCaseDialog?: () => void;
@@ -26,16 +31,40 @@ interface RibbonProps {
   onShowProjectInfoDialog?: () => void;
   onShowStandardsDialog?: () => void;
   onShowGridsDialog?: () => void;
+  onShowSteelCheck?: () => void;
+  onShowConcreteCheck?: () => void;
   onToggleAgent?: () => void;
   showAgentPanel?: boolean;
 }
 
-export function Ribbon({ onShowLoadCaseDialog, onShowCombinationDialog, onShowProjectInfoDialog, onShowStandardsDialog, onShowGridsDialog, onToggleAgent, showAgentPanel }: RibbonProps) {
-  const { state, dispatch, pushUndo } = useFEM();
-  const { selectedTool, mesh, analysisType, undoStack, redoStack, loadCases, activeLoadCase } = state;
+export function Ribbon({ onShowLoadCaseDialog, onShowCombinationDialog, onShowProjectInfoDialog, onShowStandardsDialog, onShowGridsDialog, onShowSteelCheck, onShowConcreteCheck, onToggleAgent, showAgentPanel }: RibbonProps) {
+  const { state, dispatch } = useFEM();
+  const { selectedTool, mesh, analysisType, undoStack, redoStack, loadCases, activeLoadCase,
+    result, showDeformed, showReactions, showMoment, showShear, showNormal, diagramScale,
+    loadCombinations, activeCombination, showEnvelope, deformationScale, codeCheckBeamId } = state;
   const [activeTab, setActiveTab] = useState<RibbonTab>('home');
+  const [solving, setSolving] = useState(false);
 
-  const handleSolve = (geometric: boolean = false) => {
+  const handleTabClick = (tab: RibbonTab) => {
+    setActiveTab(tab);
+    if (tab === '3d') {
+      dispatch({ type: 'SET_VIEW_MODE', payload: '3d' });
+    } else if (tab === 'results') {
+      dispatch({ type: 'SET_VIEW_MODE', payload: 'results' });
+    } else if (state.viewMode === '3d') {
+      dispatch({ type: 'SET_VIEW_MODE', payload: 'geometry' });
+    } else if (state.viewMode === 'results' && tab !== 'code-check') {
+      dispatch({ type: 'SET_VIEW_MODE', payload: 'geometry' });
+    }
+  };
+
+  // When code-check beam ID changes externally, switch to code-check tab
+  if (codeCheckBeamId !== null && activeTab !== 'code-check') {
+    setActiveTab('code-check');
+  }
+
+  const handleSolve = async (geometric: boolean = false) => {
+    setSolving(true);
     try {
       // Apply active load case to mesh before solving
       const activeLc = loadCases.find(lc => lc.id === activeLoadCase);
@@ -43,7 +72,7 @@ export function Ribbon({ onShowLoadCaseDialog, onShowCombinationDialog, onShowPr
         applyLoadCaseToMesh(mesh, activeLc);
       }
 
-      const result = solveNonlinear(mesh, {
+      const result = await solve(mesh, {
         analysisType,
         geometricNonlinear: geometric
       });
@@ -55,6 +84,8 @@ export function Ribbon({ onShowLoadCaseDialog, onShowCombinationDialog, onShowPr
       }
     } catch (e) {
       alert(`Solver error: ${(e as Error).message}`);
+    } finally {
+      setSolving(false);
     }
   };
 
@@ -62,90 +93,20 @@ export function Ribbon({ onShowLoadCaseDialog, onShowCombinationDialog, onShowPr
     dispatch({ type: 'SET_TOOL', payload: tool });
   };
 
-  const handleDemo1 = () => {
-    pushUndo();
-    mesh.clear();
-    const n1 = mesh.addNode(0, 0);
-    const n2 = mesh.addNode(3, 0);
-    const n3 = mesh.addNode(6, 0);
-    mesh.updateNode(n1.id, { constraints: { x: true, y: true, rotation: false } });
-    mesh.updateNode(n3.id, { constraints: { x: false, y: true, rotation: false } });
-    mesh.updateNode(n2.id, { loads: { fx: 0, fy: -10000, moment: 0 } });
-    const ipe200 = { A: 28.5e-4, I: 1940e-8, h: 0.200 };
-    mesh.addBeamElement([n1.id, n2.id], 1, ipe200);
-    mesh.addBeamElement([n2.id, n3.id], 1, ipe200);
-    // Update load cases for demo
-    dispatch({
-      type: 'SET_LOAD_CASES',
-      payload: [
-        { id: 1, name: 'Dead Load (G)', type: 'dead' as const, pointLoads: [{ nodeId: n2.id, fx: 0, fy: -10000, mz: 0 }], distributedLoads: [], color: '#6b7280' },
-        { id: 2, name: 'Live Load (Q)', type: 'live' as const, pointLoads: [], distributedLoads: [], color: '#3b82f6' }
-      ]
-    });
-    dispatch({ type: 'SET_ANALYSIS_TYPE', payload: 'frame' });
-    dispatch({ type: 'REFRESH_MESH' });
-    dispatch({ type: 'SET_RESULT', payload: null });
-  };
-
-  const handleDemo2 = () => {
-    pushUndo();
-    mesh.clear();
-    const n1 = mesh.addNode(0, 0);
-    const n2 = mesh.addNode(4, 0);
-    const n3 = mesh.addNode(8, 0);
-    mesh.updateNode(n1.id, { constraints: { x: true, y: true, rotation: false } });
-    mesh.updateNode(n2.id, { constraints: { x: false, y: true, rotation: false } });
-    mesh.updateNode(n3.id, { constraints: { x: false, y: true, rotation: false } });
-    const ipe300 = { A: 53.8e-4, I: 8360e-8, h: 0.300 };
-    const beam1 = mesh.addBeamElement([n1.id, n2.id], 1, ipe300);
-    mesh.addBeamElement([n2.id, n3.id], 1, ipe300);
-    if (beam1) {
-      mesh.updateBeamElement(beam1.id, { distributedLoad: { qx: 0, qy: -5000 } });
-    }
-    dispatch({
-      type: 'SET_LOAD_CASES',
-      payload: [
-        { id: 1, name: 'Dead Load (G)', type: 'dead' as const, pointLoads: [], distributedLoads: beam1 ? [{ elementId: beam1.id, qx: 0, qy: -5000 }] : [], color: '#6b7280' },
-        { id: 2, name: 'Live Load (Q)', type: 'live' as const, pointLoads: [], distributedLoads: [], color: '#3b82f6' }
-      ]
-    });
-    dispatch({ type: 'SET_ANALYSIS_TYPE', payload: 'frame' });
-    dispatch({ type: 'REFRESH_MESH' });
-    dispatch({ type: 'SET_RESULT', payload: null });
-  };
-
-  const handleDemo3 = () => {
-    pushUndo();
-    mesh.clear();
-    const n1 = mesh.addNode(0, 0);
-    const n2 = mesh.addNode(0, 4);
-    const n3 = mesh.addNode(6, 4);
-    const n4 = mesh.addNode(6, 0);
-    mesh.updateNode(n1.id, { constraints: { x: true, y: true, rotation: true } });
-    mesh.updateNode(n4.id, { constraints: { x: true, y: true, rotation: true } });
-    const hea200 = { A: 53.8e-4, I: 3690e-8, h: 0.190 };
-    mesh.addBeamElement([n1.id, n2.id], 1, hea200);
-    const beam = mesh.addBeamElement([n2.id, n3.id], 1, hea200);
-    mesh.addBeamElement([n3.id, n4.id], 1, hea200);
-    if (beam) {
-      mesh.updateBeamElement(beam.id, { distributedLoad: { qx: 0, qy: -8000 } });
-    }
-    dispatch({
-      type: 'SET_LOAD_CASES',
-      payload: [
-        { id: 1, name: 'Dead Load (G)', type: 'dead' as const, pointLoads: [], distributedLoads: beam ? [{ elementId: beam.id, qx: 0, qy: -8000 }] : [], color: '#6b7280' },
-        { id: 2, name: 'Live Load (Q)', type: 'live' as const, pointLoads: [], distributedLoads: [], color: '#3b82f6' }
-      ]
-    });
-    dispatch({ type: 'SET_ANALYSIS_TYPE', payload: 'frame' });
-    dispatch({ type: 'REFRESH_MESH' });
-    dispatch({ type: 'SET_RESULT', payload: null });
-  };
-
   const handleExportIfc = () => {
     const content = exportToIfc(mesh, state.projectInfo, loadCases);
     const filename = (state.projectInfo.name || 'project').replace(/\s+/g, '-').toLowerCase() + '.ifc';
     downloadIfc(content, filename);
+  };
+
+  const handleGenerateReport = () => {
+    downloadReport({
+      mesh,
+      result: state.result,
+      projectInfo: state.projectInfo,
+      steelGrade: STEEL_GRADES[2], // S355 default
+      forceUnit: state.forceUnit,
+    });
   };
 
   const handleSaveProject = async () => {
@@ -158,7 +119,6 @@ export function Ribbon({ onShowLoadCaseDialog, onShowCombinationDialog, onShowPr
     );
     const filename = (state.projectInfo.name || 'project').replace(/\s+/g, '-').toLowerCase() + '.fem2d.json';
 
-    // Try File System Access API first
     if ('showSaveFilePicker' in window) {
       try {
         const handle = await (window as any).showSaveFilePicker({
@@ -171,21 +131,14 @@ export function Ribbon({ onShowLoadCaseDialog, onShowCombinationDialog, onShowPr
         const writable = await handle.createWritable();
         await writable.write(json);
         await writable.close();
-        return;
       } catch (e) {
-        // User cancelled or API not supported, fall through to blob download
-        if ((e as Error).name === 'AbortError') return;
+        if ((e as Error).name !== 'AbortError') {
+          alert('Could not save file. Please use Chrome or the Electron desktop app.');
+        }
       }
+    } else {
+      alert('Save dialog not supported in this browser. Please use Chrome or the Electron desktop app.');
     }
-
-    // Fallback: blob download
-    const blob = new Blob([json], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = filename;
-    a.click();
-    URL.revokeObjectURL(url);
   };
 
   const handleOpenProject = () => {
@@ -209,28 +162,63 @@ export function Ribbon({ onShowLoadCaseDialog, onShowCombinationDialog, onShowPr
     input.click();
   };
 
+  const handleNewProject = () => {
+    if (confirm('Start a new project? Unsaved changes will be lost.')) {
+      const newMesh = new Mesh();
+      dispatch({ type: 'LOAD_PROJECT', payload: {
+        mesh: newMesh,
+        loadCases: [{ id: 1, name: 'Dead Load (G)', type: 'dead' as const, pointLoads: [], distributedLoads: [], edgeLoads: [], thermalLoads: [], color: '#6b7280' }],
+        loadCombinations: [],
+        projectInfo: { name: 'New Project', engineer: '', company: '', date: new Date().toISOString().slice(0, 10), description: '', notes: '', location: '' },
+      }});
+    }
+  };
+
   return (
     <div className="ribbon">
       {/* Ribbon Tabs */}
       <div className="ribbon-tabs">
         <button
           className={`ribbon-tab ${activeTab === 'home' ? 'active' : ''}`}
-          onClick={() => setActiveTab('home')}
+          onClick={() => handleTabClick('home')}
         >
           Home
         </button>
         <button
           className={`ribbon-tab ${activeTab === 'settings' ? 'active' : ''}`}
-          onClick={() => setActiveTab('settings')}
+          onClick={() => handleTabClick('settings')}
         >
           Settings
         </button>
         <button
           className={`ribbon-tab ${activeTab === 'standards' ? 'active' : ''}`}
-          onClick={() => setActiveTab('standards')}
+          onClick={() => handleTabClick('standards')}
         >
           Standards
         </button>
+        <button
+          className={`ribbon-tab ${activeTab === 'results' ? 'active' : ''}`}
+          onClick={() => handleTabClick('results')}
+        >
+          <BarChart3 size={14} style={{ marginRight: 4 }} />
+          Results
+        </button>
+        <button
+          className={`ribbon-tab ${activeTab === '3d' ? 'active' : ''}`}
+          onClick={() => handleTabClick('3d')}
+        >
+          <Box size={14} style={{ marginRight: 4 }} />
+          3D
+        </button>
+        {codeCheckBeamId && (
+          <button
+            className={`ribbon-tab ${activeTab === 'code-check' ? 'active' : ''}`}
+            onClick={() => handleTabClick('code-check')}
+          >
+            <CheckCircle size={14} style={{ marginRight: 4 }} />
+            Code-Check
+          </button>
+        )}
       </div>
 
       {/* Ribbon Content */}
@@ -240,7 +228,11 @@ export function Ribbon({ onShowLoadCaseDialog, onShowCombinationDialog, onShowPr
             {/* File */}
             <div className="ribbon-group">
               <div className="ribbon-group-title">File</div>
-              <div className="ribbon-group-content">
+              <div className="ribbon-group-content grid-2x2">
+                <button className="ribbon-button small" onClick={handleNewProject} title="New Project">
+                  <span className="ribbon-icon"><FileText size={14} /></span>
+                  <span>New</span>
+                </button>
                 <button className="ribbon-button small" onClick={handleSaveProject} title="Save Project">
                   <span className="ribbon-icon"><Save size={14} /></span>
                   <span>Save As</span>
@@ -261,7 +253,7 @@ export function Ribbon({ onShowLoadCaseDialog, onShowCombinationDialog, onShowPr
             {/* Draw */}
             <div className="ribbon-group">
               <div className="ribbon-group-title">Draw</div>
-              <div className="ribbon-group-content grid-2x2">
+              <div className="ribbon-group-content grid-4x2">
                 <button
                   className={`ribbon-button small ${selectedTool === 'select' ? 'active' : ''}`}
                   onClick={() => selectTool('select')}
@@ -293,6 +285,22 @@ export function Ribbon({ onShowLoadCaseDialog, onShowCombinationDialog, onShowPr
                 >
                   <span className="ribbon-icon"><CircleDot size={14} /></span>
                   <span>Node</span>
+                </button>
+                <button
+                  className={`ribbon-button small ${selectedTool === 'addElement' ? 'active' : ''}`}
+                  onClick={() => selectTool('addElement')}
+                  title="Add Triangle Element"
+                >
+                  <span className="ribbon-icon"><Triangle size={14} /></span>
+                  <span>Element</span>
+                </button>
+                <button
+                  className={`ribbon-button small ${selectedTool === 'addPlate' ? 'active' : ''}`}
+                  onClick={() => selectTool('addPlate')}
+                  title="Draw Plate Element"
+                >
+                  <span className="ribbon-icon"><Square size={14} /></span>
+                  <span>Plate</span>
                 </button>
                 <button
                   className="ribbon-button small"
@@ -375,7 +383,7 @@ export function Ribbon({ onShowLoadCaseDialog, onShowCombinationDialog, onShowPr
             {/* Loads */}
             <div className="ribbon-group">
               <div className="ribbon-group-title">Loads</div>
-              <div className="ribbon-group-content">
+              <div className="ribbon-group-content grid-3x2">
                 <button
                   className={`ribbon-button small ${selectedTool === 'addLineLoad' ? 'active' : ''}`}
                   onClick={() => selectTool('addLineLoad')}
@@ -410,6 +418,22 @@ export function Ribbon({ onShowLoadCaseDialog, onShowCombinationDialog, onShowPr
                   <span>Moment</span>
                 </button>
                 <button
+                  className={`ribbon-button small ${selectedTool === 'addEdgeLoad' ? 'active' : ''}`}
+                  onClick={() => selectTool('addEdgeLoad')}
+                  title="Edge Load on Plate"
+                >
+                  <span className="ribbon-icon"><ArrowDown size={14} /></span>
+                  <span>Edge Load</span>
+                </button>
+                <button
+                  className={`ribbon-button small ${selectedTool === 'addThermalLoad' ? 'active' : ''}`}
+                  onClick={() => selectTool('addThermalLoad')}
+                  title="Thermal Load"
+                >
+                  <span className="ribbon-icon"><Thermometer size={14} /></span>
+                  <span>Temp</span>
+                </button>
+                <button
                   className="ribbon-button small"
                   title="Load Cases"
                   onClick={onShowLoadCaseDialog}
@@ -434,7 +458,7 @@ export function Ribbon({ onShowLoadCaseDialog, onShowCombinationDialog, onShowPr
             <div className="ribbon-group">
               <div className="ribbon-group-title">Edit</div>
               <div className="ribbon-group-content grid-3x2">
-                <button className="ribbon-button small" title="Move (M)">
+                <button className="ribbon-button small" onClick={() => selectTool('select')} title="Move (M)">
                   <span className="ribbon-icon"><Move size={14} /></span>
                   <span>Move</span>
                 </button>
@@ -494,9 +518,9 @@ export function Ribbon({ onShowLoadCaseDialog, onShowCombinationDialog, onShowPr
             <div className="ribbon-group highlight">
               <div className="ribbon-group-title">Calculate</div>
               <div className="ribbon-group-content">
-                <button className="ribbon-button primary" onClick={() => handleSolve(false)} title="Run Analysis (F5)">
+                <button className="ribbon-button primary" onClick={() => handleSolve(false)} disabled={solving} title="Run Analysis (F5)">
                   <span className="ribbon-icon"><Play size={18} /></span>
-                  <span>Solve</span>
+                  <span>{solving ? 'Solving...' : 'Solve'}</span>
                 </button>
               </div>
             </div>
@@ -537,14 +561,15 @@ export function Ribbon({ onShowLoadCaseDialog, onShowCombinationDialog, onShowPr
                   <option value="frame">2D Frame Analysis</option>
                   <option value="plane_stress">Plane Stress</option>
                   <option value="plane_strain">Plane Strain</option>
+                  <option value="plate_bending">Plate Bending (DKT)</option>
                 </select>
-                <button className="ribbon-button small" onClick={() => handleSolve(false)} title="Linear Analysis (F5)">
+                <button className="ribbon-button small" onClick={() => handleSolve(false)} disabled={solving} title="Linear Analysis (F5)">
                   <span className="ribbon-icon"><Play size={14} /></span>
-                  <span>Linear</span>
+                  <span>{solving ? 'Solving...' : 'Linear'}</span>
                 </button>
-                <button className="ribbon-button small" onClick={() => handleSolve(true)} title="P-Delta Analysis">
+                <button className="ribbon-button small" onClick={() => handleSolve(true)} disabled={solving} title="P-Delta Analysis">
                   <span className="ribbon-icon"><FastForward size={14} /></span>
-                  <span>P-Delta</span>
+                  <span>{solving ? 'Solving...' : 'P-Delta'}</span>
                 </button>
                 <button
                   className="ribbon-button small"
@@ -590,31 +615,291 @@ export function Ribbon({ onShowLoadCaseDialog, onShowCombinationDialog, onShowPr
                   <span className="ribbon-icon"><Download size={14} /></span>
                   <span>Save IFC</span>
                 </button>
+                <button className="ribbon-button small" onClick={handleGenerateReport} title="Generate HTML Report">
+                  <span className="ribbon-icon"><FileText size={14} /></span>
+                  <span>Report</span>
+                </button>
+              </div>
+            </div>
+
+          </>
+        )}
+
+        {activeTab === 'results' && (
+          <>
+            {/* Display */}
+            <div className="ribbon-group">
+              <div className="ribbon-group-title">Display</div>
+              <div className="ribbon-group-content wrap">
+                <label className="ribbon-toggle">
+                  <input
+                    type="checkbox"
+                    checked={showDeformed}
+                    onChange={(e) => dispatch({ type: 'SET_SHOW_DEFORMED', payload: e.target.checked })}
+                  />
+                  <span>Deformed</span>
+                </label>
+                <label className="ribbon-toggle">
+                  <input
+                    type="checkbox"
+                    checked={showReactions}
+                    onChange={(e) => dispatch({ type: 'SET_SHOW_REACTIONS', payload: e.target.checked })}
+                  />
+                  <span>Reactions</span>
+                </label>
               </div>
             </div>
 
             <div className="ribbon-separator" />
 
-            {/* Examples */}
+            {/* Deformation Scale */}
             <div className="ribbon-group">
-              <div className="ribbon-group-title">Examples</div>
+              <div className="ribbon-group-title">Deformation Scale</div>
               <div className="ribbon-group-content">
-                <button className="ribbon-button small" onClick={handleDemo1}>
-                  <span className="ribbon-icon"><Minus size={14} /></span>
-                  <span>Beam</span>
-                </button>
-                <button className="ribbon-button small" onClick={handleDemo2}>
-                  <span className="ribbon-icon"><GripVertical size={14} /></span>
-                  <span>Cont.</span>
-                </button>
-                <button className="ribbon-button small" onClick={handleDemo3}>
-                  <span className="ribbon-icon"><Square size={14} /></span>
-                  <span>Portal</span>
-                </button>
+                <input
+                  type="range"
+                  className="ribbon-range"
+                  min="1"
+                  max="1000"
+                  value={deformationScale}
+                  onChange={(e) => dispatch({ type: 'SET_DEFORMATION_SCALE', payload: parseInt(e.target.value) })}
+                />
+                <span className="ribbon-range-value">{deformationScale}x</span>
+              </div>
+            </div>
+
+            <div className="ribbon-separator" />
+
+            {/* Diagrams */}
+            {analysisType === 'frame' && (
+              <>
+                <div className="ribbon-group">
+                  <div className="ribbon-group-title">Diagrams</div>
+                  <div className="ribbon-group-content wrap">
+                    <label className="ribbon-toggle" style={{ color: '#ef4444' }}>
+                      <input
+                        type="checkbox"
+                        checked={showMoment}
+                        onChange={(e) => dispatch({ type: 'SET_SHOW_MOMENT', payload: e.target.checked })}
+                      />
+                      <span>M</span>
+                    </label>
+                    <label className="ribbon-toggle" style={{ color: '#3b82f6' }}>
+                      <input
+                        type="checkbox"
+                        checked={showShear}
+                        onChange={(e) => dispatch({ type: 'SET_SHOW_SHEAR', payload: e.target.checked })}
+                      />
+                      <span>V</span>
+                    </label>
+                    <label className="ribbon-toggle" style={{ color: '#22c55e' }}>
+                      <input
+                        type="checkbox"
+                        checked={showNormal}
+                        onChange={(e) => dispatch({ type: 'SET_SHOW_NORMAL', payload: e.target.checked })}
+                      />
+                      <span>N</span>
+                    </label>
+                  </div>
+                </div>
+
+                <div className="ribbon-separator" />
+
+                <div className="ribbon-group">
+                  <div className="ribbon-group-title">Diagram Scale</div>
+                  <div className="ribbon-group-content">
+                    <input
+                      type="range"
+                      className="ribbon-range"
+                      min="10"
+                      max="200"
+                      value={diagramScale}
+                      onChange={(e) => dispatch({ type: 'SET_DIAGRAM_SCALE', payload: parseInt(e.target.value) })}
+                    />
+                    <span className="ribbon-range-value">{diagramScale}</span>
+                  </div>
+                </div>
+
+                <div className="ribbon-separator" />
+              </>
+            )}
+
+            {/* Combinations */}
+            {loadCombinations.length > 0 && (
+              <div className="ribbon-group">
+                <div className="ribbon-group-title">Combinations</div>
+                <div className="ribbon-group-content">
+                  <select
+                    className="ribbon-select"
+                    value={activeCombination ?? ''}
+                    onChange={(e) => {
+                      const val = e.target.value;
+                      dispatch({
+                        type: 'SET_ACTIVE_COMBINATION',
+                        payload: val === '' ? null : parseInt(val)
+                      });
+                    }}
+                  >
+                    <option value="">Load Case</option>
+                    {loadCombinations.map(lc => (
+                      <option key={lc.id} value={lc.id}>{lc.name}</option>
+                    ))}
+                  </select>
+                  <label className="ribbon-toggle" style={{ color: '#f59e0b' }}>
+                    <input
+                      type="checkbox"
+                      checked={showEnvelope}
+                      onChange={(e) => dispatch({ type: 'SET_SHOW_ENVELOPE', payload: e.target.checked })}
+                    />
+                    <span>Envelope</span>
+                  </label>
+                </div>
+              </div>
+            )}
+          </>
+        )}
+
+        {activeTab === '3d' && (
+          <>
+            <div className="ribbon-group">
+              <div className="ribbon-group-title">3D Preview</div>
+              <div className="ribbon-group-content">
+                <span style={{ color: 'var(--text-muted)', fontSize: 11, padding: '0 8px' }}>
+                  3D visualization of the structure
+                </span>
               </div>
             </div>
           </>
         )}
+
+        {activeTab === 'code-check' && codeCheckBeamId !== null && (() => {
+          const beam = mesh.getBeamElement(codeCheckBeamId);
+          if (!beam || !result || !result.beamForces.has(codeCheckBeamId)) {
+            return (
+              <div className="ribbon-group">
+                <div className="ribbon-group-title">Code-Check</div>
+                <div className="ribbon-group-content">
+                  <span style={{ color: 'var(--text-muted)', fontSize: 11, padding: '0 8px' }}>
+                    No results available. Run analysis first.
+                  </span>
+                  <button className="ribbon-button small" onClick={() => dispatch({ type: 'SET_CODE_CHECK_BEAM', payload: null })}>
+                    <span>Close</span>
+                  </button>
+                </div>
+              </div>
+            );
+          }
+
+          const forces = result.beamForces.get(codeCheckBeamId)!;
+          const grade = STEEL_GRADES[2]; // S355
+          const section = beam.section;
+          const check = checkSteelSection(
+            { A: section.A, I: section.I, h: section.h, profileName: beam.profileName },
+            forces,
+            grade
+          );
+          const nodes = mesh.getBeamElementNodes(beam);
+          const L = nodes ? calculateBeamLength(nodes[0], nodes[1]) : 0;
+          const fmtN = (v: number) => `${(v / 1000).toFixed(1)} kN`;
+          const fmtM = (v: number) => `${(v / 1000).toFixed(1)} kNm`;
+          const ucColor = (uc: number) => uc <= 1.0 ? 'var(--success)' : 'var(--danger)';
+          const ucBar = (uc: number, label: string) => (
+            <div className="code-check-row">
+              <span className="code-check-label">{label}</span>
+              <div className="code-check-bar-track">
+                <div className="code-check-bar-fill" style={{ width: `${Math.min(uc * 100, 100)}%`, background: ucColor(uc) }} />
+              </div>
+              <span className="code-check-uc" style={{ color: ucColor(uc) }}>{uc.toFixed(3)}</span>
+            </div>
+          );
+
+          return (
+            <>
+              {/* Beam Info */}
+              <div className="ribbon-group">
+                <div className="ribbon-group-title">Beam {codeCheckBeamId}</div>
+                <div className="ribbon-group-content code-check-info">
+                  <span>{beam.profileName || 'Unknown'} | L = {(L * 1000).toFixed(0)} mm | {grade.name} (fy = {grade.fy} MPa)</span>
+                </div>
+              </div>
+
+              <div className="ribbon-separator" />
+
+              {/* Design Forces */}
+              <div className="ribbon-group">
+                <div className="ribbon-group-title">Ed (Design Forces)</div>
+                <div className="ribbon-group-content code-check-forces">
+                  <div className="code-check-force-item">
+                    <span className="code-check-force-label">N<sub>Ed</sub></span>
+                    <span className="code-check-force-value">{fmtN(check.NEd)}</span>
+                  </div>
+                  <div className="code-check-force-item">
+                    <span className="code-check-force-label">V<sub>Ed</sub></span>
+                    <span className="code-check-force-value">{fmtN(check.VEd)}</span>
+                  </div>
+                  <div className="code-check-force-item">
+                    <span className="code-check-force-label">M<sub>Ed</sub></span>
+                    <span className="code-check-force-value">{fmtM(check.MEd)}</span>
+                  </div>
+                </div>
+              </div>
+
+              <div className="ribbon-separator" />
+
+              {/* Design Resistances */}
+              <div className="ribbon-group">
+                <div className="ribbon-group-title">Rd (Resistance)</div>
+                <div className="ribbon-group-content code-check-forces">
+                  <div className="code-check-force-item">
+                    <span className="code-check-force-label">N<sub>c,Rd</sub></span>
+                    <span className="code-check-force-value">{fmtN(check.NcRd)}</span>
+                  </div>
+                  <div className="code-check-force-item">
+                    <span className="code-check-force-label">V<sub>c,Rd</sub></span>
+                    <span className="code-check-force-value">{fmtN(check.VcRd)}</span>
+                  </div>
+                  <div className="code-check-force-item">
+                    <span className="code-check-force-label">M<sub>c,Rd</sub></span>
+                    <span className="code-check-force-value">{fmtM(check.McRd)}</span>
+                  </div>
+                </div>
+              </div>
+
+              <div className="ribbon-separator" />
+
+              {/* Unity Checks */}
+              <div className="ribbon-group" style={{ minWidth: 220 }}>
+                <div className="ribbon-group-title">Unity Checks (EN 1993-1-1)</div>
+                <div className="ribbon-group-content code-check-ucs">
+                  {ucBar(check.UC_N, 'N (6.2.4)')}
+                  {ucBar(check.UC_V, 'V (6.2.6)')}
+                  {ucBar(check.UC_M, 'M (6.2.5)')}
+                  {ucBar(check.UC_MN, 'M+N (6.2.8)')}
+                  {ucBar(check.UC_MV, 'M+V (6.2.10)')}
+                </div>
+              </div>
+
+              <div className="ribbon-separator" />
+
+              {/* Result */}
+              <div className="ribbon-group">
+                <div className="ribbon-group-title">Result</div>
+                <div className="ribbon-group-content code-check-result">
+                  <div className={`code-check-status ${check.status === 'OK' ? 'pass' : 'fail'}`}>
+                    UC = {check.UC_max.toFixed(3)}
+                    <br />
+                    <strong>{check.status === 'OK' ? 'PASS' : 'FAIL'}</strong>
+                    <br />
+                    <small>{check.governingCheck}</small>
+                  </div>
+                  <button className="ribbon-button small" onClick={() => dispatch({ type: 'SET_CODE_CHECK_BEAM', payload: null })} title="Close Code-Check">
+                    <span>Close</span>
+                  </button>
+                </div>
+              </div>
+            </>
+          );
+        })()}
 
         {activeTab === 'standards' && (
           <>
@@ -660,6 +945,32 @@ export function Ribbon({ onShowLoadCaseDialog, onShowCombinationDialog, onShowPr
                 <button className="ribbon-button small" title="EN 1992 - Concrete">
                   <span className="ribbon-icon"><FileText size={14} /></span>
                   <span>EN 1992</span>
+                </button>
+              </div>
+            </div>
+
+            <div className="ribbon-separator" />
+
+            <div className="ribbon-group">
+              <div className="ribbon-group-title">Section Checks</div>
+              <div className="ribbon-group-content">
+                <button
+                  className="ribbon-button small"
+                  onClick={onShowSteelCheck}
+                  title="Steel section check (EN 1993-1-1)"
+                  disabled={!state.result}
+                >
+                  <span className="ribbon-icon"><CheckCircle size={14} /></span>
+                  <span>Steel Check</span>
+                </button>
+                <button
+                  className="ribbon-button small"
+                  onClick={onShowConcreteCheck}
+                  title="Concrete section design (EN 1992-1-1)"
+                  disabled={!state.result}
+                >
+                  <span className="ribbon-icon"><CheckCircle size={14} /></span>
+                  <span>Concrete</span>
                 </button>
               </div>
             </div>

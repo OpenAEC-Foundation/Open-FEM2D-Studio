@@ -30,23 +30,9 @@ export function VisibilityPanel({ collapsed, onToggleCollapse }: VisibilityPanel
     showNodeLabels,
     showMemberLabels,
     forceUnit,
-    autoRecalculate,
-    viewState
+    displacementUnit,
+    structuralGrid
   } = state;
-
-  const handleZoomIn = () => {
-    const newScale = Math.min(500, viewState.scale * 1.2);
-    dispatch({ type: 'SET_VIEW_STATE', payload: { scale: newScale } });
-  };
-
-  const handleZoomOut = () => {
-    const newScale = Math.max(10, viewState.scale * 0.8);
-    dispatch({ type: 'SET_VIEW_STATE', payload: { scale: newScale } });
-  };
-
-  const handleFitAll = () => {
-    dispatch({ type: 'SET_VIEW_STATE', payload: { offsetX: 150, offsetY: 350, scale: 80 } });
-  };
 
   if (collapsed) {
     return (
@@ -80,6 +66,26 @@ export function VisibilityPanel({ collapsed, onToggleCollapse }: VisibilityPanel
                 onChange={(e) => dispatch({ type: 'SET_SNAP_TO_GRID', payload: e.target.checked })}
               />
               <span className="toggle-text">Snap to Grid</span>
+            </label>
+          </div>
+          <div className="toggle-row">
+            <label className="toggle-label">
+              <input
+                type="checkbox"
+                checked={structuralGrid.showGridLines}
+                onChange={(e) => dispatch({ type: 'SET_SHOW_GRID_LINES', payload: e.target.checked })}
+              />
+              <span className="toggle-text">Show Grid Lines</span>
+            </label>
+          </div>
+          <div className="toggle-row">
+            <label className="toggle-label">
+              <input
+                type="checkbox"
+                checked={structuralGrid.snapToGridLines}
+                onChange={(e) => dispatch({ type: 'SET_SNAP_TO_GRID_LINES', payload: e.target.checked })}
+              />
+              <span className="toggle-text">Snap to Grid Lines</span>
             </label>
           </div>
           <div className="slider-row">
@@ -201,20 +207,16 @@ export function VisibilityPanel({ collapsed, onToggleCollapse }: VisibilityPanel
               <option value="N">N</option>
             </select>
           </div>
-        </div>
-
-        {/* Auto-recalculate */}
-        <div className="panel-section">
-          <div className="section-title">Solver</div>
-          <div className="toggle-row">
-            <label className="toggle-label">
-              <input
-                type="checkbox"
-                checked={autoRecalculate}
-                onChange={(e) => dispatch({ type: 'SET_AUTO_RECALCULATE', payload: e.target.checked })}
-              />
-              <span className="toggle-text">Auto-recalculate</span>
-            </label>
+          <div className="slider-row">
+            <span className="slider-label">Displacement</span>
+            <select
+              className="unit-select"
+              value={displacementUnit}
+              onChange={(e) => dispatch({ type: 'SET_DISPLACEMENT_UNIT', payload: e.target.value as 'mm' | 'm' })}
+            >
+              <option value="mm">mm</option>
+              <option value="m">m</option>
+            </select>
           </div>
         </div>
 
@@ -307,15 +309,7 @@ export function VisibilityPanel({ collapsed, onToggleCollapse }: VisibilityPanel
           </div>
         )}
 
-        {/* Quick Actions */}
-        <div className="panel-section">
-          <div className="section-title">Quick Actions</div>
-          <div className="quick-buttons">
-            <button className="quick-button" onClick={handleZoomIn}>Zoom In</button>
-            <button className="quick-button" onClick={handleZoomOut}>Zoom Out</button>
-            <button className="quick-button" onClick={handleFitAll}>Fit All</button>
-          </div>
-        </div>
+
       </div>
     </div>
   );

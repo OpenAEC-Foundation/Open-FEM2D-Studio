@@ -2,27 +2,64 @@ import { Matrix } from '../math/Matrix';
 import { Mesh } from '../fem/Mesh';
 import { AnalysisType } from '../fem/types';
 import { calculateElementStiffness } from '../fem/Triangle';
+import { calculateDKTStiffness } from '../fem/DKT';
 import { calculateBeamGlobalStiffness, calculateDistributedLoadVector, calculatePartialDistributedLoadVector, transformLocalToGlobal, calculateBeamLength, calculateBeamAngle } from '../fem/Beam';
+
+/**
+ * Collect only the nodes that participate in the current analysis type.
+ * For frame: nodes used by beam elements.
+ * For plane_stress/plane_strain: nodes used by triangle elements.
+ * This prevents disconnected nodes from creating zero-stiffness DOFs (singular matrix).
+ */
+function getActiveNodeIds(mesh: Mesh, analysisType: AnalysisType): Set<number> {
+  const activeIds = new Set<number>();
+  if (analysisType === 'frame') {
+    for (const beam of mesh.beamElements.values()) {
+      for (const nid of beam.nodeIds) activeIds.add(nid);
+    }
+  } else {
+    for (const elem of mesh.elements.values()) {
+      for (const nid of elem.nodeIds) activeIds.add(nid);
+    }
+  }
+  return activeIds;
+}
+
+/**
+ * Build a node-ID-to-sequential-index mapping for active nodes only.
+ */
+export function buildNodeIdToIndex(mesh: Mesh, analysisType: AnalysisType): Map<number, number> {
+  const activeIds = getActiveNodeIds(mesh, analysisType);
+  const nodeIdToIndex = new Map<number, number>();
+  let index = 0;
+  for (const node of mesh.nodes.values()) {
+    if (activeIds.has(node.id)) {
+      nodeIdToIndex.set(node.id, index);
+      index++;
+    }
+  }
+  return nodeIdToIndex;
+}
+
+/** Get DOFs per node for the given analysis type. */
+export function getDofsPerNode(analysisType: AnalysisType): number {
+  if (analysisType === 'frame') return 3;  // u, v, θ
+  if (analysisType === 'plate_bending') return 3;  // w, θx, θy
+  return 2;  // u, v
+}
 
 export function assembleGlobalStiffnessMatrix(
   mesh: Mesh,
   analysisType: AnalysisType
 ): Matrix {
-  // For frame analysis, use 3 DOFs per node (u, v, θ)
-  // For plane stress/strain, use 2 DOFs per node (u, v)
-  const numNodes = mesh.getNodeCount();
-  const dofsPerNode = analysisType === 'frame' ? 3 : 2;
+  const dofsPerNode = getDofsPerNode(analysisType);
+
+  // Create node ID to index mapping (active nodes only)
+  const nodeIdToIndex = buildNodeIdToIndex(mesh, analysisType);
+  const numNodes = nodeIdToIndex.size;
   const numDofs = numNodes * dofsPerNode;
 
   const K = new Matrix(numDofs, numDofs);
-
-  // Create node ID to index mapping
-  const nodeIdToIndex = new Map<number, number>();
-  let index = 0;
-  for (const node of mesh.nodes.values()) {
-    nodeIdToIndex.set(node.id, index);
-    index++;
-  }
 
   if (analysisType === 'frame') {
     // Assemble beam elements for frame analysis
@@ -73,6 +110,39 @@ export function assembleGlobalStiffnessMatrix(
         console.warn(`Skipping beam element ${beam.id}: ${e}`);
       }
     }
+  } else if (analysisType === 'plate_bending') {
+    // Assemble DKT plate bending elements (9×9, 3 DOFs/node)
+    for (const element of mesh.elements.values()) {
+      const nodes = mesh.getElementNodes(element);
+      if (nodes.length !== 3) continue;
+
+      const material = mesh.getMaterial(element.materialId);
+      if (!material) continue;
+
+      const [n1, n2, n3] = nodes;
+
+      try {
+        const Ke = calculateDKTStiffness(n1, n2, n3, material, element.thickness);
+
+        // Get global DOF indices: 3 DOFs per node (w, θx, θy)
+        const dofIndices: number[] = [];
+        for (const node of nodes) {
+          const nodeIndex = nodeIdToIndex.get(node.id)!;
+          dofIndices.push(nodeIndex * 3);     // w
+          dofIndices.push(nodeIndex * 3 + 1); // θx
+          dofIndices.push(nodeIndex * 3 + 2); // θy
+        }
+
+        // Assemble 9×9 into global matrix
+        for (let i = 0; i < 9; i++) {
+          for (let j = 0; j < 9; j++) {
+            K.addAt(dofIndices[i], dofIndices[j], Ke.get(i, j));
+          }
+        }
+      } catch (e) {
+        console.warn(`Skipping DKT element ${element.id}: ${e}`);
+      }
+    }
   } else {
     // Assemble triangle elements for plane stress/strain
     for (const element of mesh.elements.values()) {
@@ -116,23 +186,25 @@ export function assembleGlobalStiffnessMatrix(
 }
 
 export function assembleForceVector(mesh: Mesh, analysisType: AnalysisType = 'plane_stress'): number[] {
-  const numNodes = mesh.getNodeCount();
-  const dofsPerNode = analysisType === 'frame' ? 3 : 2;
+  const dofsPerNode = getDofsPerNode(analysisType);
+
+  // Create node ID to index mapping (active nodes only)
+  const nodeIdToIndex = buildNodeIdToIndex(mesh, analysisType);
+  const numNodes = nodeIdToIndex.size;
   const numDofs = numNodes * dofsPerNode;
   const F: number[] = new Array(numDofs).fill(0);
 
-  // Create node ID to index mapping
-  const nodeIdToIndex = new Map<number, number>();
-  let index = 0;
+  // Add nodal forces (only for active nodes)
   for (const node of mesh.nodes.values()) {
-    nodeIdToIndex.set(node.id, index);
-    index++;
-  }
-
-  // Add nodal forces
-  for (const node of mesh.nodes.values()) {
-    const nodeIndex = nodeIdToIndex.get(node.id)!;
-    if (dofsPerNode === 3) {
+    const nodeIndex = nodeIdToIndex.get(node.id);
+    if (nodeIndex === undefined) continue;
+    if (analysisType === 'plate_bending') {
+      // Plate bending: DOFs are w, θx, θy
+      // fz goes into the w DOF, rotations stay 0 unless explicit
+      F[nodeIndex * 3] = node.loads.fz ?? node.loads.fy; // use fy as transverse if fz not set
+      F[nodeIndex * 3 + 1] = 0;
+      F[nodeIndex * 3 + 2] = 0;
+    } else if (dofsPerNode === 3) {
       F[nodeIndex * 3] = node.loads.fx;
       F[nodeIndex * 3 + 1] = node.loads.fy;
       F[nodeIndex * 3 + 2] = node.loads.moment ?? 0;
@@ -202,19 +274,25 @@ export function getConstrainedDofs(
   mesh: Mesh,
   analysisType: AnalysisType = 'plane_stress'
 ): { dofs: number[]; nodeIdToIndex: Map<number, number> } {
-  const nodeIdToIndex = new Map<number, number>();
-  let index = 0;
-  for (const node of mesh.nodes.values()) {
-    nodeIdToIndex.set(node.id, index);
-    index++;
-  }
+  // Use active nodes only to match the stiffness matrix
+  const nodeIdToIndex = buildNodeIdToIndex(mesh, analysisType);
 
-  const dofsPerNode = analysisType === 'frame' ? 3 : 2;
+  const dofsPerNode = getDofsPerNode(analysisType);
   const dofs: number[] = [];
 
   for (const node of mesh.nodes.values()) {
-    const nodeIndex = nodeIdToIndex.get(node.id)!;
-    if (dofsPerNode === 3) {
+    const nodeIndex = nodeIdToIndex.get(node.id);
+    if (nodeIndex === undefined) continue;
+    if (analysisType === 'plate_bending') {
+      // plate_bending: DOFs are w, θx, θy
+      // y constraint → w fixed (vertical displacement constrained)
+      if (node.constraints.y) dofs.push(nodeIndex * 3);
+      // rotation constraint → θx and θy fixed
+      if (node.constraints.rotation) {
+        dofs.push(nodeIndex * 3 + 1);
+        dofs.push(nodeIndex * 3 + 2);
+      }
+    } else if (dofsPerNode === 3) {
       if (node.constraints.x) dofs.push(nodeIndex * 3);
       if (node.constraints.y) dofs.push(nodeIndex * 3 + 1);
       if (node.constraints.rotation) dofs.push(nodeIndex * 3 + 2);

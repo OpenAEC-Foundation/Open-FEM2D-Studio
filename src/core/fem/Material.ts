@@ -7,7 +7,8 @@ export const DEFAULT_MATERIALS: IMaterial[] = [
     E: 210e9,      // 210 GPa
     nu: 0.3,
     rho: 7850,     // kg/m³
-    color: '#3b82f6'
+    color: '#3b82f6',
+    alpha: 12e-6   // 1/°C
   },
   {
     id: 2,
@@ -15,7 +16,8 @@ export const DEFAULT_MATERIALS: IMaterial[] = [
     E: 70e9,       // 70 GPa
     nu: 0.33,
     rho: 2700,
-    color: '#a855f7'
+    color: '#a855f7',
+    alpha: 23e-6
   },
   {
     id: 3,
@@ -23,7 +25,8 @@ export const DEFAULT_MATERIALS: IMaterial[] = [
     E: 30e9,       // 30 GPa
     nu: 0.2,
     rho: 2400,
-    color: '#6b7280'
+    color: '#6b7280',
+    alpha: 10e-6
   },
   {
     id: 4,
@@ -31,7 +34,8 @@ export const DEFAULT_MATERIALS: IMaterial[] = [
     E: 12e9,       // 12 GPa
     nu: 0.3,
     rho: 600,
-    color: '#92400e'
+    color: '#92400e',
+    alpha: 5e-6
   },
   {
     id: 5,
@@ -39,7 +43,8 @@ export const DEFAULT_MATERIALS: IMaterial[] = [
     E: 200e9,
     nu: 0.3,
     rho: 7800,
-    color: '#10b981'
+    color: '#10b981',
+    alpha: 12e-6
   }
 ];
 

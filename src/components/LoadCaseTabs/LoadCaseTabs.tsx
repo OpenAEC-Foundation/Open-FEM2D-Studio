@@ -2,12 +2,25 @@ import { useFEM, ViewMode } from '../../context/FEMContext';
 import { Ruler, ArrowDown, BarChart3 } from 'lucide-react';
 import './LoadCaseTabs.css';
 
-export function LoadCaseTabs() {
+interface LoadCaseTabsProps {
+  onSolve?: () => void;
+}
+
+export function LoadCaseTabs({ onSolve }: LoadCaseTabsProps) {
   const { state, dispatch } = useFEM();
-  const { viewMode, activeLoadCase, mesh, result, loadCases } = state;
+  const {
+    viewMode, activeLoadCase, mesh, result, loadCases
+  } = state;
 
   const setViewMode = (mode: ViewMode) => {
     dispatch({ type: 'SET_VIEW_MODE', payload: mode });
+  };
+
+  const handleResultsClick = () => {
+    if (!result && onSolve) {
+      onSolve();
+    }
+    setViewMode('results');
   };
 
   const setActiveLoadCase = (id: number) => {
@@ -41,9 +54,9 @@ export function LoadCaseTabs() {
         </button>
         <button
           className={`view-mode-tab ${viewMode === 'results' ? 'active' : ''}`}
-          onClick={() => setViewMode('results')}
-          disabled={!result}
-          title={!result ? 'Run analysis first' : 'View results'}
+          onClick={handleResultsClick}
+          disabled={mesh.getNodeCount() < 2}
+          title="View results"
         >
           <span className="tab-icon"><BarChart3 size={14} /></span>
           <span className="tab-name">Results</span>

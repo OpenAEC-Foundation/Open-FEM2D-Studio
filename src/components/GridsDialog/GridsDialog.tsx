@@ -27,6 +27,10 @@ export function GridsDialog({ onClose }: GridsDialogProps) {
   const { state, dispatch } = useFEM();
   const [grid, setGrid] = useState<IStructuralGrid>({ ...state.structuralGrid });
 
+  // Display in mm, store in meters
+  const toMm = (m: number) => Math.round(m * 1000);
+  const toM = (mm: number) => mm / 1000;
+
   const addVertical = () => {
     const lastPos = grid.verticalLines.length > 0
       ? Math.max(...grid.verticalLines.map(l => l.position)) + 3
@@ -94,12 +98,12 @@ export function GridsDialog({ onClose }: GridsDialogProps) {
   return (
     <div className="grids-dialog-overlay" onClick={onClose}>
       <div className="grids-dialog" onClick={e => e.stopPropagation()}>
-        <div className="grids-dialog-header">Structural Grids (Stramienen)</div>
+        <div className="grids-dialog-header">Structural Grids</div>
         <div className="grids-dialog-body">
           {/* Vertical grid lines (stramienen) */}
           <div className="grids-section">
             <div className="grids-section-header">
-              <span>Stramienen (Vertical)</span>
+              <span>Grids (Vertical)</span>
               <div className="grids-section-actions">
                 <button className="grids-action-btn" onClick={distributeVertical} title="Distribute evenly">
                   Distribute
@@ -113,7 +117,7 @@ export function GridsDialog({ onClose }: GridsDialogProps) {
               <thead>
                 <tr>
                   <th>Name</th>
-                  <th>X-position (m)</th>
+                  <th>X-position (mm)</th>
                   <th></th>
                 </tr>
               </thead>
@@ -131,10 +135,10 @@ export function GridsDialog({ onClose }: GridsDialogProps) {
                     <td>
                       <input
                         type="number"
-                        value={line.position}
-                        onChange={e => updateVertical(line.id, { position: parseFloat(e.target.value) || 0 })}
+                        value={toMm(line.position)}
+                        onChange={e => updateVertical(line.id, { position: toM(parseFloat(e.target.value) || 0) })}
                         className="grids-input"
-                        step="0.5"
+                        step="500"
                       />
                     </td>
                     <td>
@@ -154,7 +158,7 @@ export function GridsDialog({ onClose }: GridsDialogProps) {
           {/* Horizontal grid lines (levels) */}
           <div className="grids-section">
             <div className="grids-section-header">
-              <span>Levels (Horizontal)</span>
+              <span>Elevations (Horizontal)</span>
               <div className="grids-section-actions">
                 <button className="grids-action-btn" onClick={addHorizontal}>
                   <Plus size={12} /> Add
@@ -164,8 +168,8 @@ export function GridsDialog({ onClose }: GridsDialogProps) {
             <table className="grids-table">
               <thead>
                 <tr>
-                  <th>Peilmaat</th>
-                  <th>Y-elevation (m)</th>
+                  <th>Elevation</th>
+                  <th>Z-elevation (mm)</th>
                   <th></th>
                 </tr>
               </thead>
@@ -183,10 +187,10 @@ export function GridsDialog({ onClose }: GridsDialogProps) {
                     <td>
                       <input
                         type="number"
-                        value={line.position}
-                        onChange={e => updateHorizontal(line.id, { position: parseFloat(e.target.value) || 0 })}
+                        value={toMm(line.position)}
+                        onChange={e => updateHorizontal(line.id, { position: toM(parseFloat(e.target.value) || 0) })}
                         className="grids-input"
-                        step="0.5"
+                        step="500"
                       />
                     </td>
                     <td>
@@ -203,25 +207,6 @@ export function GridsDialog({ onClose }: GridsDialogProps) {
             </table>
           </div>
 
-          {/* Display options */}
-          <div className="grids-options">
-            <label className="grids-checkbox">
-              <input
-                type="checkbox"
-                checked={grid.showGridLines}
-                onChange={e => setGrid({ ...grid, showGridLines: e.target.checked })}
-              />
-              <span>Show grid lines on canvas</span>
-            </label>
-            <label className="grids-checkbox">
-              <input
-                type="checkbox"
-                checked={grid.snapToGridLines}
-                onChange={e => setGrid({ ...grid, snapToGridLines: e.target.checked })}
-              />
-              <span>Snap to grid lines</span>
-            </label>
-          </div>
         </div>
         <div className="grids-dialog-footer">
           <button className="grids-btn cancel" onClick={onClose}>Cancel</button>

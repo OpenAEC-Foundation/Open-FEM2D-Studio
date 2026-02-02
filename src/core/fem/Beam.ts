@@ -299,15 +299,15 @@ export const DEFAULT_SECTIONS: { name: string; section: IBeamSection }[] = [
     section: { A: 53.8e-4, I: 3690e-8, h: 0.190 }
   },
   {
-    name: 'Rechthoek 100x200',
+    name: 'Rectangle 100x200',
     section: { A: 0.02, I: 6.667e-5, h: 0.200 }  // b=100mm, h=200mm
   },
   {
-    name: 'Rechthoek 200x400',
+    name: 'Rectangle 200x400',
     section: { A: 0.08, I: 1.067e-3, h: 0.400 }  // b=200mm, h=400mm
   },
   {
-    name: 'Buis 100x5',
+    name: 'Tube 100x5',
     section: { A: 14.92e-4, I: 168e-8, h: 0.100 }  // D=100mm, t=5mm
   }
 ];

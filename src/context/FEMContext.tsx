@@ -1,10 +1,12 @@
 import React, { createContext, useContext, useReducer, useCallback, ReactNode } from 'react';
 import { Mesh } from '../core/fem/Mesh';
-import { ISolverResult, Tool, IViewState, ISelection, AnalysisType } from '../core/fem/types';
+import { ISolverResult, Tool, IViewState, ISelection, AnalysisType, StressType } from '../core/fem/types';
 import { ILoadCase, ILoadCombination } from '../core/fem/LoadCase';
+import { convertEdgeLoadToNodalForces } from '../core/fem/PlateRegion';
 import { IStructuralGrid } from '../core/fem/StructuralGrid';
+import { calculateThermalNodalForces } from '../core/fem/ThermalLoad';
 
-export type ViewMode = 'geometry' | 'loads' | 'results';
+export type ViewMode = 'geometry' | 'loads' | 'results' | '3d';
 
 export interface IProjectInfo {
   name: string;
@@ -13,6 +15,7 @@ export interface IProjectInfo {
   date: string;
   description: string;
   notes: string;
+  location: string;
 }
 
 interface FEMState {
@@ -25,7 +28,7 @@ interface FEMState {
   showDeformed: boolean;
   deformationScale: number;
   showStress: boolean;
-  stressType: 'vonMises' | 'sigmaX' | 'sigmaY' | 'tauXY';
+  stressType: StressType;
   pendingNodes: number[];
   gridSize: number;
   snapToGrid: boolean;
@@ -51,6 +54,12 @@ interface FEMState {
   showMemberLabels: boolean;
   // Force unit
   forceUnit: 'N' | 'kN';
+  // Displacement unit
+  displacementUnit: 'mm' | 'm';
+  // Active combination for results (null = individual load case)
+  activeCombination: number | null;
+  // Envelope results (min/max across all combinations)
+  showEnvelope: boolean;
   // Auto-recalculate
   autoRecalculate: boolean;
   // Canvas refresh counter
@@ -65,6 +74,8 @@ interface FEMState {
   projectInfo: IProjectInfo;
   // Structural grid
   structuralGrid: IStructuralGrid;
+  // Code-check: beam ID for which to show the steel check report
+  codeCheckBeamId: number | null;
 }
 
 type FEMAction =
@@ -86,7 +97,7 @@ type FEMAction =
   | { type: 'SET_SHOW_DEFORMED'; payload: boolean }
   | { type: 'SET_DEFORMATION_SCALE'; payload: number }
   | { type: 'SET_SHOW_STRESS'; payload: boolean }
-  | { type: 'SET_STRESS_TYPE'; payload: 'vonMises' | 'sigmaX' | 'sigmaY' | 'tauXY' }
+  | { type: 'SET_STRESS_TYPE'; payload: StressType }
   | { type: 'ADD_PENDING_NODE'; payload: number }
   | { type: 'CLEAR_PENDING_NODES' }
   | { type: 'REFRESH_MESH' }
@@ -107,10 +118,17 @@ type FEMAction =
   | { type: 'PUSH_UNDO' }
   | { type: 'SET_LOAD_CASES'; payload: ILoadCase[] }
   | { type: 'SET_LOAD_COMBINATIONS'; payload: ILoadCombination[] }
+  | { type: 'SET_ACTIVE_COMBINATION'; payload: number | null }
   | { type: 'ADD_POINT_LOAD'; payload: { lcId: number; nodeId: number; fx: number; fy: number; mz: number } }
-  | { type: 'ADD_DISTRIBUTED_LOAD'; payload: { lcId: number; beamId: number; qx: number; qy: number } }
+  | { type: 'ADD_DISTRIBUTED_LOAD'; payload: { lcId: number; beamId: number; qx: number; qy: number; qxEnd?: number; qyEnd?: number; startT?: number; endT?: number; coordSystem?: 'local' | 'global' } }
   | { type: 'REMOVE_POINT_LOAD'; payload: { lcId: number; nodeId: number } }
   | { type: 'REMOVE_DISTRIBUTED_LOAD'; payload: { lcId: number; beamId: number } }
+  | { type: 'SELECT_PLATE'; payload: number }
+  | { type: 'DESELECT_PLATE'; payload: number }
+  | { type: 'ADD_EDGE_LOAD'; payload: { lcId: number; plateId: number; edge: 'top' | 'bottom' | 'left' | 'right'; px: number; py: number } }
+  | { type: 'REMOVE_EDGE_LOAD'; payload: { lcId: number; plateId: number; edge: string } }
+  | { type: 'ADD_THERMAL_LOAD'; payload: { lcId: number; elementId: number; plateId?: number; deltaT: number } }
+  | { type: 'REMOVE_THERMAL_LOAD'; payload: { lcId: number; elementId: number } }
   | { type: 'SET_PROJECT_INFO'; payload: Partial<IProjectInfo> }
   | { type: 'LOAD_PROJECT'; payload: { mesh: Mesh; loadCases: ILoadCase[]; loadCombinations: ILoadCombination[]; projectInfo: IProjectInfo; structuralGrid?: IStructuralGrid } }
   | { type: 'SET_STRUCTURAL_GRID'; payload: IStructuralGrid }
@@ -123,14 +141,19 @@ type FEMAction =
   | { type: 'SET_SHOW_NODE_LABELS'; payload: boolean }
   | { type: 'SET_SHOW_MEMBER_LABELS'; payload: boolean }
   | { type: 'SET_FORCE_UNIT'; payload: 'N' | 'kN' }
-  | { type: 'SET_AUTO_RECALCULATE'; payload: boolean };
+  | { type: 'SET_DISPLACEMENT_UNIT'; payload: 'mm' | 'm' }
+  | { type: 'SET_AUTO_RECALCULATE'; payload: boolean }
+  | { type: 'SET_SHOW_ENVELOPE'; payload: boolean }
+  | { type: 'SET_CODE_CHECK_BEAM'; payload: number | null }
+  | { type: 'CLEANUP_PLATE_LOADS'; payload: { plateId: number; elementIds: number[] } };
 
 function createEmptySelection(): ISelection {
   return {
     nodeIds: new Set(),
     elementIds: new Set(),
     pointLoadNodeIds: new Set(),
-    distLoadBeamIds: new Set()
+    distLoadBeamIds: new Set(),
+    plateIds: new Set()
   };
 }
 
@@ -168,6 +191,8 @@ function createDefaultLoadCases(demoNodeId: number): ILoadCase[] {
         { nodeId: demoNodeId, fx: 0, fy: -10000, mz: 0 }
       ],
       distributedLoads: [],
+      edgeLoads: [],
+      thermalLoads: [],
       color: '#6b7280'
     },
     {
@@ -176,6 +201,8 @@ function createDefaultLoadCases(demoNodeId: number): ILoadCase[] {
       type: 'live',
       pointLoads: [],
       distributedLoads: [],
+      edgeLoads: [],
+      thermalLoads: [],
       color: '#3b82f6'
     }
   ];
@@ -246,8 +273,68 @@ export function applyLoadCaseToMesh(mesh: Mesh, loadCase: ILoadCase): void {
     const beam = mesh.getBeamElement(dl.elementId);
     if (beam) {
       mesh.updateBeamElement(dl.elementId, {
-        distributedLoad: { qx: dl.qx, qy: dl.qy }
+        distributedLoad: {
+          qx: dl.qx,
+          qy: dl.qy,
+          qxEnd: dl.qxEnd,
+          qyEnd: dl.qyEnd,
+          startT: dl.startT,
+          endT: dl.endT,
+          coordSystem: dl.coordSystem
+        }
       });
+    }
+  }
+
+  // Apply edge loads from load case
+  if (loadCase.edgeLoads) {
+    for (const el of loadCase.edgeLoads) {
+      const plate = mesh.getPlateRegion(el.plateId);
+      if (plate) {
+        const nodalForces = convertEdgeLoadToNodalForces(mesh, plate, el);
+        for (const nf of nodalForces) {
+          const node = mesh.getNode(nf.nodeId);
+          if (node) {
+            mesh.updateNode(nf.nodeId, {
+              loads: {
+                fx: node.loads.fx + nf.fx,
+                fy: node.loads.fy + nf.fy,
+                moment: node.loads.moment
+              }
+            });
+          }
+        }
+      }
+    }
+  }
+
+  // Apply thermal loads from load case
+  if (loadCase.thermalLoads) {
+    for (const tl of loadCase.thermalLoads) {
+      const element = mesh.getElement(tl.elementId);
+      if (!element) continue;
+      const nodes = mesh.getElementNodes(element);
+      if (nodes.length !== 3) continue;
+      const material = mesh.getMaterial(element.materialId);
+      if (!material) continue;
+
+      const F = calculateThermalNodalForces(
+        nodes[0], nodes[1], nodes[2],
+        material, element.thickness, tl.deltaT, 'plane_stress'
+      );
+
+      for (let i = 0; i < 3; i++) {
+        const node = mesh.getNode(nodes[i].id);
+        if (node) {
+          mesh.updateNode(node.id, {
+            loads: {
+              fx: node.loads.fx + F[i * 2],
+              fy: node.loads.fy + F[i * 2 + 1],
+              moment: node.loads.moment
+            }
+          });
+        }
+      }
     }
   }
 }
@@ -286,9 +373,37 @@ export function applyCombinedLoadsToMesh(mesh: Mesh, loadCases: ILoadCase[], com
         mesh.updateBeamElement(dl.elementId, {
           distributedLoad: {
             qx: existing.qx + dl.qx * factor,
-            qy: existing.qy + dl.qy * factor
+            qy: existing.qy + dl.qy * factor,
+            qxEnd: (existing.qxEnd ?? existing.qx) + (dl.qxEnd ?? dl.qx) * factor,
+            qyEnd: (existing.qyEnd ?? existing.qy) + (dl.qyEnd ?? dl.qy) * factor,
+            startT: dl.startT,
+            endT: dl.endT,
+            coordSystem: dl.coordSystem
           }
         });
+      }
+    }
+
+    // Apply edge loads with factor
+    if (lc.edgeLoads) {
+      for (const el of lc.edgeLoads) {
+        const plate = mesh.getPlateRegion(el.plateId);
+        if (plate) {
+          const factoredLoad = { ...el, px: el.px * factor, py: el.py * factor };
+          const nodalForces = convertEdgeLoadToNodalForces(mesh, plate, factoredLoad);
+          for (const nf of nodalForces) {
+            const node = mesh.getNode(nf.nodeId);
+            if (node) {
+              mesh.updateNode(nf.nodeId, {
+                loads: {
+                  fx: node.loads.fx + nf.fx,
+                  fy: node.loads.fy + nf.fy,
+                  moment: node.loads.moment
+                }
+              });
+            }
+          }
+        }
       }
     }
   }
@@ -329,7 +444,10 @@ const initialState: FEMState = {
   showNodeLabels: true,
   showMemberLabels: true,
   forceUnit: 'kN',
-  autoRecalculate: false,
+  displacementUnit: 'mm',
+  activeCombination: null,
+  showEnvelope: false,
+  autoRecalculate: true,
   meshVersion: 0,
   undoStack: [],
   redoStack: [],
@@ -341,9 +459,11 @@ const initialState: FEMState = {
     company: '',
     date: new Date().toISOString().slice(0, 10),
     description: '',
-    notes: ''
+    notes: '',
+    location: ''
   },
-  structuralGrid: createDefaultStructuralGrid()
+  structuralGrid: createDefaultStructuralGrid(),
+  codeCheckBeamId: null
 };
 
 // Apply demo load case loads to mesh so they render on first load
@@ -367,7 +487,8 @@ function femReducer(state: FEMState, action: FEMAction): FEMState {
           nodeIds: action.payload.nodeIds ?? new Set(),
           elementIds: action.payload.elementIds ?? new Set(),
           pointLoadNodeIds: action.payload.pointLoadNodeIds ?? new Set(),
-          distLoadBeamIds: action.payload.distLoadBeamIds ?? new Set()
+          distLoadBeamIds: action.payload.distLoadBeamIds ?? new Set(),
+          plateIds: action.payload.plateIds ?? new Set()
         }
       };
 
@@ -546,6 +667,9 @@ function femReducer(state: FEMState, action: FEMAction): FEMState {
     case 'SET_LOAD_COMBINATIONS':
       return { ...state, loadCombinations: action.payload };
 
+    case 'SET_ACTIVE_COMBINATION':
+      return { ...state, activeCombination: action.payload };
+
     case 'ADD_POINT_LOAD': {
       const { lcId, nodeId, fx, fy, mz } = action.payload;
       const newLoadCases = state.loadCases.map(lc => {
@@ -561,12 +685,12 @@ function femReducer(state: FEMState, action: FEMAction): FEMState {
     }
 
     case 'ADD_DISTRIBUTED_LOAD': {
-      const { lcId, beamId, qx, qy } = action.payload;
+      const { lcId, beamId, qx, qy, qxEnd, qyEnd, startT, endT, coordSystem } = action.payload;
       const newLoadCases = state.loadCases.map(lc => {
         if (lc.id !== lcId) return lc;
         const filtered = lc.distributedLoads.filter(dl => dl.elementId !== beamId);
-        if (qx !== 0 || qy !== 0) {
-          filtered.push({ elementId: beamId, qx, qy });
+        if (qx !== 0 || qy !== 0 || (qxEnd !== undefined && qxEnd !== 0) || (qyEnd !== undefined && qyEnd !== 0)) {
+          filtered.push({ elementId: beamId, qx, qy, qxEnd, qyEnd, startT, endT, coordSystem });
         }
         return { ...lc, distributedLoads: filtered };
       });
@@ -587,6 +711,69 @@ function femReducer(state: FEMState, action: FEMAction): FEMState {
       const newLoadCases = state.loadCases.map(lc => {
         if (lc.id !== lcId) return lc;
         return { ...lc, distributedLoads: lc.distributedLoads.filter(dl => dl.elementId !== beamId) };
+      });
+      return { ...state, loadCases: newLoadCases };
+    }
+
+    case 'SELECT_PLATE': {
+      const newPlateIds = new Set(state.selection.plateIds);
+      newPlateIds.add(action.payload);
+      return { ...state, selection: { ...state.selection, plateIds: newPlateIds } };
+    }
+
+    case 'DESELECT_PLATE': {
+      const newPlateIds = new Set(state.selection.plateIds);
+      newPlateIds.delete(action.payload);
+      return { ...state, selection: { ...state.selection, plateIds: newPlateIds } };
+    }
+
+    case 'ADD_EDGE_LOAD': {
+      const { lcId, plateId, edge, px, py } = action.payload;
+      const newLoadCases = state.loadCases.map(lc => {
+        if (lc.id !== lcId) return lc;
+        const filtered = (lc.edgeLoads || []).filter(
+          el => !(el.plateId === plateId && el.edge === edge)
+        );
+        if (px !== 0 || py !== 0) {
+          filtered.push({ plateId, edge, px, py });
+        }
+        return { ...lc, edgeLoads: filtered };
+      });
+      return { ...state, loadCases: newLoadCases };
+    }
+
+    case 'REMOVE_EDGE_LOAD': {
+      const { lcId, plateId, edge } = action.payload;
+      const newLoadCases = state.loadCases.map(lc => {
+        if (lc.id !== lcId) return lc;
+        return {
+          ...lc,
+          edgeLoads: (lc.edgeLoads || []).filter(
+            el => !(el.plateId === plateId && el.edge === edge)
+          )
+        };
+      });
+      return { ...state, loadCases: newLoadCases };
+    }
+
+    case 'ADD_THERMAL_LOAD': {
+      const { lcId, elementId, plateId, deltaT } = action.payload;
+      const newLoadCases = state.loadCases.map(lc => {
+        if (lc.id !== lcId) return lc;
+        const filtered = (lc.thermalLoads || []).filter(tl => tl.elementId !== elementId);
+        if (deltaT !== 0) {
+          filtered.push({ elementId, plateId, deltaT });
+        }
+        return { ...lc, thermalLoads: filtered };
+      });
+      return { ...state, loadCases: newLoadCases };
+    }
+
+    case 'REMOVE_THERMAL_LOAD': {
+      const { lcId, elementId } = action.payload;
+      const newLoadCases = state.loadCases.map(lc => {
+        if (lc.id !== lcId) return lc;
+        return { ...lc, thermalLoads: (lc.thermalLoads || []).filter(tl => tl.elementId !== elementId) };
       });
       return { ...state, loadCases: newLoadCases };
     }
@@ -641,8 +828,30 @@ function femReducer(state: FEMState, action: FEMAction): FEMState {
     case 'SET_FORCE_UNIT':
       return { ...state, forceUnit: action.payload };
 
+    case 'SET_DISPLACEMENT_UNIT':
+      return { ...state, displacementUnit: action.payload };
+
     case 'SET_AUTO_RECALCULATE':
       return { ...state, autoRecalculate: action.payload };
+
+    case 'SET_SHOW_ENVELOPE':
+      return { ...state, showEnvelope: action.payload };
+
+    case 'SET_CODE_CHECK_BEAM':
+      return { ...state, codeCheckBeamId: action.payload };
+
+    case 'CLEANUP_PLATE_LOADS': {
+      const { plateId, elementIds } = action.payload;
+      const elementIdSet = new Set(elementIds);
+      const cleanedLoadCases = state.loadCases.map(lc => ({
+        ...lc,
+        edgeLoads: (lc.edgeLoads || []).filter(el => el.plateId !== plateId),
+        thermalLoads: (lc.thermalLoads || []).filter(tl =>
+          tl.plateId !== plateId && !elementIdSet.has(tl.elementId)
+        )
+      }));
+      return { ...state, loadCases: cleanedLoadCases };
+    }
 
     default:
       return state;

@@ -1,4 +1,4 @@
-import { INode, IElement, IMaterial, IMesh, ITriangleElement, IBeamElement, IBeamSection } from './types';
+import { INode, IElement, IMaterial, IMesh, ITriangleElement, IBeamElement, IBeamSection, IPlateRegion } from './types';
 import { DEFAULT_MATERIALS } from './Material';
 import { DEFAULT_SECTIONS } from './Beam';
 
@@ -8,9 +8,11 @@ export class Mesh implements IMesh {
   beamElements: Map<number, IBeamElement>;
   materials: Map<number, IMaterial>;
   sections: Map<string, IBeamSection>;
+  plateRegions: Map<number, IPlateRegion>;
   private nextNodeId: number;
   private nextElementId: number;
   private nextMaterialId: number;
+  private nextPlateId: number;
 
   constructor() {
     this.nodes = new Map();
@@ -18,9 +20,11 @@ export class Mesh implements IMesh {
     this.beamElements = new Map();
     this.materials = new Map();
     this.sections = new Map();
+    this.plateRegions = new Map();
     this.nextNodeId = 1;
     this.nextElementId = 1;
     this.nextMaterialId = 10;
+    this.nextPlateId = 1;
 
     // Add default materials
     DEFAULT_MATERIALS.forEach(m => this.materials.set(m.id, { ...m }));
@@ -43,6 +47,47 @@ export class Mesh implements IMesh {
 
   removeNode(id: number): boolean {
     if (!this.nodes.has(id)) return false;
+
+    // Cascade: if node belongs to a plate region, remove the whole plate
+    const platesToRemove: number[] = [];
+    for (const [plateId, plate] of this.plateRegions) {
+      if (plate.nodeIds.includes(id)) {
+        platesToRemove.push(plateId);
+      }
+    }
+    for (const plateId of platesToRemove) {
+      const plate = this.plateRegions.get(plateId);
+      if (plate) {
+        // Remove all elements of the plate
+        for (const elemId of plate.elementIds) {
+          this.elements.delete(elemId);
+        }
+        // Remove plate-only nodes (except the one being removed, handled below)
+        for (const nodeId of plate.nodeIds) {
+          if (nodeId !== id) {
+            // Check if used elsewhere
+            let usedElsewhere = false;
+            for (const beam of this.beamElements.values()) {
+              if (beam.nodeIds.includes(nodeId)) { usedElsewhere = true; break; }
+            }
+            if (!usedElsewhere) {
+              for (const [pid, otherPlate] of this.plateRegions) {
+                if (pid !== plateId && otherPlate.nodeIds.includes(nodeId)) { usedElsewhere = true; break; }
+              }
+            }
+            if (!usedElsewhere) {
+              for (const elem of this.elements.values()) {
+                if (elem.nodeIds.includes(nodeId)) { usedElsewhere = true; break; }
+              }
+            }
+            if (!usedElsewhere) {
+              this.nodes.delete(nodeId);
+            }
+          }
+        }
+        this.plateRegions.delete(plateId);
+      }
+    }
 
     // Cascade: remove triangle elements connected to this node
     for (const [elemId, element] of this.elements) {
@@ -281,12 +326,37 @@ export class Mesh implements IMesh {
     return this.splitBeamAt(beamId, position, { fx, fy, moment });
   }
 
+  addPlateRegion(plate: IPlateRegion): IPlateRegion {
+    plate.id = this.nextPlateId++;
+    this.plateRegions.set(plate.id, plate);
+    return plate;
+  }
+
+  removePlateRegion(plateId: number): boolean {
+    return this.plateRegions.delete(plateId);
+  }
+
+  getPlateRegion(id: number): IPlateRegion | undefined {
+    return this.plateRegions.get(id);
+  }
+
+  getPlateForElement(elemId: number): IPlateRegion | undefined {
+    for (const plate of this.plateRegions.values()) {
+      if (plate.elementIds.includes(elemId)) {
+        return plate;
+      }
+    }
+    return undefined;
+  }
+
   clear(): void {
     this.nodes.clear();
     this.elements.clear();
     this.beamElements.clear();
+    this.plateRegions.clear();
     this.nextNodeId = 1;
     this.nextElementId = 1;
+    this.nextPlateId = 1;
   }
 
   getElementNodes(element: IElement): INode[] {
@@ -320,7 +390,8 @@ export class Mesh implements IMesh {
       elements: Array.from(this.elements.values()),
       beamElements: Array.from(this.beamElements.values()),
       materials: Array.from(this.materials.values()),
-      sections: Array.from(this.sections.entries()).map(([name, section]) => ({ name, section }))
+      sections: Array.from(this.sections.entries()).map(([name, section]) => ({ name, section })),
+      plateRegions: Array.from(this.plateRegions.values())
     };
   }
 
@@ -330,12 +401,14 @@ export class Mesh implements IMesh {
     beamElements?: IBeamElement[];
     materials: IMaterial[];
     sections?: { name: string; section: IBeamSection }[];
+    plateRegions?: IPlateRegion[];
   }): Mesh {
     const mesh = new Mesh();
     mesh.nodes.clear();
     mesh.elements.clear();
     mesh.beamElements.clear();
     mesh.materials.clear();
+    mesh.plateRegions.clear();
 
     data.materials.forEach(m => mesh.materials.set(m.id, m));
 
@@ -368,14 +441,21 @@ export class Mesh implements IMesh {
       data.beamElements.forEach(b => mesh.beamElements.set(b.id, b));
     }
 
+    if (data.plateRegions) {
+      data.plateRegions.forEach(p => mesh.plateRegions.set(p.id, p));
+    }
+
     const allElementIds = [
       ...data.elements.map(e => e.id),
       ...(data.beamElements || []).map(b => b.id)
     ];
 
+    const allPlateIds = (data.plateRegions || []).map(p => p.id);
+
     mesh.nextNodeId = Math.max(...data.nodes.map(n => n.id), 0) + 1;
     mesh.nextElementId = Math.max(...allElementIds, 0) + 1;
     mesh.nextMaterialId = Math.max(...data.materials.map(m => m.id), 10) + 1;
+    mesh.nextPlateId = Math.max(...allPlateIds, 0) + 1;
 
     return mesh;
   }

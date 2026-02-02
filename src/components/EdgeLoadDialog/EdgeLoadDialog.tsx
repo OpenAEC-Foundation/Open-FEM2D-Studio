@@ -1,0 +1,101 @@
+import { useState } from 'react';
+import './EdgeLoadDialog.css';
+
+interface EdgeLoadDialogProps {
+  edge: 'top' | 'bottom' | 'left' | 'right';
+  loadCases: { id: number; name: string }[];
+  activeLoadCase: number;
+  onApply: (px: number, py: number, lcId: number, edge: 'top' | 'bottom' | 'left' | 'right') => void;
+  onCancel: () => void;
+}
+
+export function EdgeLoadDialog({
+  edge,
+  loadCases,
+  activeLoadCase,
+  onApply,
+  onCancel,
+}: EdgeLoadDialogProps) {
+  const [selectedEdge, setSelectedEdge] = useState<'top' | 'bottom' | 'left' | 'right'>(edge);
+  const [px, setPx] = useState('0');
+  const [py, setPy] = useState('-10');
+  const [selectedLC, setSelectedLC] = useState(activeLoadCase);
+
+  const handleApply = () => {
+    const valPx = parseFloat(px);
+    const valPy = parseFloat(py);
+    if (isNaN(valPx) && isNaN(valPy)) return;
+    onApply(isNaN(valPx) ? 0 : valPx, isNaN(valPy) ? 0 : valPy, selectedLC, selectedEdge);
+  };
+
+  const keyHandler = (e: React.KeyboardEvent) => {
+    if (e.key === 'Enter') handleApply();
+    if (e.key === 'Escape') onCancel();
+  };
+
+  return (
+    <div className="edge-load-dialog-overlay" onClick={onCancel}>
+      <div className="edge-load-dialog" onClick={e => e.stopPropagation()}>
+        <div className="edge-load-dialog-header">Edge Load</div>
+        <div className="edge-load-dialog-body">
+          <label>
+            <span>Load Case</span>
+            <select
+              value={selectedLC}
+              onChange={e => setSelectedLC(parseInt(e.target.value))}
+            >
+              {loadCases.map(lc => (
+                <option key={lc.id} value={lc.id}>{lc.name}</option>
+              ))}
+            </select>
+          </label>
+
+          <label>
+            <span>Edge</span>
+            <select
+              value={selectedEdge}
+              onChange={e => setSelectedEdge(e.target.value as 'top' | 'bottom' | 'left' | 'right')}
+            >
+              <option value="bottom">Bottom</option>
+              <option value="top">Top</option>
+              <option value="left">Left</option>
+              <option value="right">Right</option>
+            </select>
+          </label>
+
+          <div className="edge-load-row">
+            <label>
+              <span>px (kN/m)</span>
+              <input
+                type="text"
+                value={px}
+                onChange={e => setPx(e.target.value)}
+                onFocus={e => e.target.select()}
+                onKeyDown={keyHandler}
+              />
+            </label>
+            <label>
+              <span>py (kN/m)</span>
+              <input
+                type="text"
+                value={py}
+                onChange={e => setPy(e.target.value)}
+                autoFocus
+                onFocus={e => e.target.select()}
+                onKeyDown={keyHandler}
+              />
+            </label>
+          </div>
+
+          <p className="edge-load-hint">
+            Negative py = downward. Load is applied uniformly along the selected edge.
+          </p>
+        </div>
+        <div className="edge-load-dialog-footer">
+          <button className="edge-load-btn cancel" onClick={onCancel}>Cancel</button>
+          <button className="edge-load-btn confirm" onClick={handleApply}>OK</button>
+        </div>
+      </div>
+    </div>
+  );
+}

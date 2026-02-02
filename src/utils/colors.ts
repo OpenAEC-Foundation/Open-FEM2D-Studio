@@ -56,15 +56,27 @@ export function formatStress(value: number): string {
   return `${value.toFixed(2)} Pa`;
 }
 
-export function formatDisplacement(value: number): string {
+export function formatMomentPerLength(value: number): string {
   const absValue = Math.abs(value);
-
-  if (absValue >= 1) {
-    return `${value.toFixed(4)} m`;
-  } else if (absValue >= 1e-3) {
-    return `${(value * 1e3).toFixed(4)} mm`;
-  } else if (absValue >= 1e-6) {
-    return `${(value * 1e6).toFixed(4)} µm`;
+  if (absValue >= 1e6) {
+    return `${(value / 1e6).toFixed(2)} MNm/m`;
+  } else if (absValue >= 1e3) {
+    return `${(value / 1e3).toFixed(2)} kNm/m`;
   }
-  return `${(value * 1e9).toFixed(4)} nm`;
+  return `${value.toFixed(2)} Nm/m`;
+}
+
+export function formatDisplacement(value: number): string {
+  // Always display in mm for structural engineering convention
+  const mm = value * 1e3;
+  const absMm = Math.abs(mm);
+
+  if (absMm >= 100) {
+    return `${mm.toFixed(1)} mm`;
+  } else if (absMm >= 1) {
+    return `${mm.toFixed(2)} mm`;
+  } else if (absMm >= 0.01) {
+    return `${mm.toFixed(3)} mm`;
+  }
+  return `${mm.toFixed(4)} mm`;
 }

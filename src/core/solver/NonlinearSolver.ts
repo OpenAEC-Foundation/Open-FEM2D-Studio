@@ -7,7 +7,7 @@
 
 import { Matrix } from '../math/Matrix';
 import { Mesh } from '../fem/Mesh';
-import { ISolverResult, IBeamForces, AnalysisType } from '../fem/types';
+import { ISolverResult, IBeamForces, IElementStress, AnalysisType } from '../fem/types';
 import {
   calculateBeamLength,
   calculateBeamAngle,
@@ -15,6 +15,9 @@ import {
   createTransformationMatrix
 } from '../fem/Beam';
 import { calculateBeamInternalForces } from '../fem/BeamForces';
+import { calculateElementStress, calculatePrincipalStresses } from '../fem/Triangle';
+import { calculateElementMoments } from '../fem/DKT';
+import { assembleGlobalStiffnessMatrix, assembleForceVector as assembleForceVectorNew, getConstrainedDofs, getDofsPerNode } from './Assembler';
 import { solveLinearSystem } from '../math/GaussElimination';
 
 export interface NonlinearSolverOptions {
@@ -334,7 +337,12 @@ export function solveNonlinear(
 ): ISolverResult {
   const opts = { ...DEFAULT_OPTIONS, ...options };
 
-  // Validate
+  // For plate-related analyses, delegate to the Assembler-based path
+  if (opts.analysisType === 'plate_bending' || opts.analysisType === 'plane_stress' || opts.analysisType === 'plane_strain') {
+    return solvePlateOrPlane(mesh, opts);
+  }
+
+  // Validate frame analysis
   if (mesh.getNodeCount() < 2) {
     throw new Error('Model must have at least 2 nodes');
   }
@@ -455,5 +463,133 @@ export function solveNonlinear(
     beamForces,
     maxVonMises,
     minVonMises: 0
+  };
+}
+
+/**
+ * Solve plane stress/strain or plate bending using the Assembler module.
+ */
+function solvePlateOrPlane(
+  mesh: Mesh,
+  opts: NonlinearSolverOptions
+): ISolverResult {
+  const analysisType = opts.analysisType;
+  const dofsPerNode = getDofsPerNode(analysisType);
+
+  // Validate
+  if (mesh.elements.size < 1) {
+    throw new Error('Model must have at least 1 triangle element');
+  }
+
+  let hasConstraints = false;
+  for (const node of mesh.nodes.values()) {
+    if (node.constraints.x || node.constraints.y || node.constraints.rotation) {
+      hasConstraints = true;
+      break;
+    }
+  }
+  if (!hasConstraints) {
+    throw new Error('Model has no constraints - add boundary conditions');
+  }
+
+  // Assemble
+  const K = assembleGlobalStiffnessMatrix(mesh, analysisType);
+  const F = assembleForceVectorNew(mesh, analysisType);
+  const { dofs: constrainedDofs, nodeIdToIndex } = getConstrainedDofs(mesh, analysisType);
+
+  const hasLoads = F.some(f => f !== 0);
+  if (!hasLoads) {
+    throw new Error('No loads applied - add forces to nodes or elements');
+  }
+
+  // Apply boundary conditions (penalty method)
+  const Kmod = K.clone();
+  const Fmod = [...F];
+  const penalty = 1e20;
+  for (const dof of constrainedDofs) {
+    Kmod.set(dof, dof, Kmod.get(dof, dof) + penalty);
+    Fmod[dof] = 0;
+  }
+
+  // Solve
+  const displacements = solveLinearSystem(Kmod, Fmod);
+
+  // Reactions: R = K·u - F
+  const reactions = K.multiplyVector(displacements);
+  for (let i = 0; i < reactions.length; i++) {
+    reactions[i] = reactions[i] - F[i];
+  }
+
+  // Post-processing: element stresses / moments
+  const elementStresses = new Map<number, IElementStress>();
+  let maxVonMises = 0;
+  let minVonMises = Infinity;
+  let maxMoment = -Infinity;
+  let minMoment = Infinity;
+
+  for (const element of mesh.elements.values()) {
+    const nodes = mesh.getElementNodes(element);
+    if (nodes.length !== 3) continue;
+
+    const material = mesh.getMaterial(element.materialId);
+    if (!material) continue;
+
+    const [n1, n2, n3] = nodes;
+
+    // Extract element displacements
+    const elemDisp: number[] = [];
+    for (const node of nodes) {
+      const idx = nodeIdToIndex.get(node.id);
+      if (idx === undefined) continue;
+      for (let d = 0; d < dofsPerNode; d++) {
+        elemDisp.push(displacements[idx * dofsPerNode + d]);
+      }
+    }
+
+    if (analysisType === 'plate_bending') {
+      // Calculate moments
+      const moments = calculateElementMoments(n1, n2, n3, material, element.thickness, elemDisp);
+      const stress: IElementStress = {
+        elementId: element.id,
+        sigmaX: 0,
+        sigmaY: 0,
+        tauXY: 0,
+        vonMises: 0,
+        principalStresses: { sigma1: 0, sigma2: 0, angle: 0 },
+        mx: moments.mx,
+        my: moments.my,
+        mxy: moments.mxy,
+      };
+      elementStresses.set(element.id, stress);
+
+      maxMoment = Math.max(maxMoment, moments.mx, moments.my, moments.mxy);
+      minMoment = Math.min(minMoment, moments.mx, moments.my, moments.mxy);
+    } else {
+      // Plane stress/strain
+      const stress = calculateElementStress(n1, n2, n3, material, elemDisp, analysisType);
+      const principal = calculatePrincipalStresses(stress.sigmaX, stress.sigmaY, stress.tauXY);
+      elementStresses.set(element.id, {
+        elementId: element.id,
+        ...stress,
+        principalStresses: principal,
+      });
+      maxVonMises = Math.max(maxVonMises, stress.vonMises);
+      minVonMises = Math.min(minVonMises, stress.vonMises);
+    }
+  }
+
+  if (minVonMises === Infinity) minVonMises = 0;
+  if (maxMoment === -Infinity) maxMoment = 0;
+  if (minMoment === Infinity) minMoment = 0;
+
+  return {
+    displacements,
+    reactions,
+    elementStresses,
+    beamForces: new Map(),
+    maxVonMises,
+    minVonMises,
+    maxMoment: analysisType === 'plate_bending' ? maxMoment : undefined,
+    minMoment: analysisType === 'plate_bending' ? minMoment : undefined,
   };
 }

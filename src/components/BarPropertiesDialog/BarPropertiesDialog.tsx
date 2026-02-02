@@ -15,11 +15,40 @@ export function BarPropertiesDialog({ beam, length, onUpdate, onClose }: BarProp
   const [section, setSection] = useState<IBeamSection>(beam.section);
   const [startMomentRelease, setStartMomentRelease] = useState(beam.endReleases?.startMoment ?? false);
   const [endMomentRelease, setEndMomentRelease] = useState(beam.endReleases?.endMoment ?? false);
+  const [startAxialRelease, setStartAxialRelease] = useState(beam.endReleases?.startAxial ?? false);
+  const [endAxialRelease, setEndAxialRelease] = useState(beam.endReleases?.endAxial ?? false);
+  const [startShearRelease, setStartShearRelease] = useState(beam.endReleases?.startShear ?? false);
+  const [endShearRelease, setEndShearRelease] = useState(beam.endReleases?.endShear ?? false);
+
+  const setAllReleases = (val: boolean) => {
+    setStartMomentRelease(val);
+    setEndMomentRelease(val);
+    setStartAxialRelease(val);
+    setEndAxialRelease(val);
+    setStartShearRelease(val);
+    setEndShearRelease(val);
+  };
+
+  const applyHingePreset = () => {
+    setStartMomentRelease(true);
+    setEndMomentRelease(true);
+    setStartAxialRelease(false);
+    setEndAxialRelease(false);
+    setStartShearRelease(false);
+    setEndShearRelease(false);
+  };
 
   const handleApply = () => {
     onUpdate({
       section,
-      endReleases: { startMoment: startMomentRelease, endMoment: endMomentRelease }
+      endReleases: {
+        startMoment: startMomentRelease,
+        endMoment: endMomentRelease,
+        startAxial: startAxialRelease,
+        endAxial: endAxialRelease,
+        startShear: startShearRelease,
+        endShear: endShearRelease,
+      }
     });
     onClose();
   };
@@ -71,26 +100,55 @@ export function BarPropertiesDialog({ beam, length, onUpdate, onClose }: BarProp
             Change Section...
           </button>
 
-          <div className="bar-props-section-title">End Releases (Hinges)</div>
-          <div className="bar-props-row">
-            <label className="bar-props-checkbox-label">
-              <input
-                type="checkbox"
-                checked={startMomentRelease}
-                onChange={(e) => setStartMomentRelease(e.target.checked)}
-              />
-              <span>Start node: moment release</span>
-            </label>
+          <div className="bar-props-section-title">End Releases</div>
+          <div className="bar-props-preset-row">
+            <button
+              className="bar-props-preset-btn"
+              onClick={() => setAllReleases(false)}
+              title="All DOFs fixed (no releases)"
+            >
+              Fully Fixed
+            </button>
+            <button
+              className="bar-props-preset-btn"
+              onClick={applyHingePreset}
+              title="Moment released at both ends"
+            >
+              Hinge
+            </button>
           </div>
-          <div className="bar-props-row">
-            <label className="bar-props-checkbox-label">
-              <input
-                type="checkbox"
-                checked={endMomentRelease}
-                onChange={(e) => setEndMomentRelease(e.target.checked)}
-              />
-              <span>End node: moment release</span>
-            </label>
+
+          <div className="bar-props-release-grid">
+            <div className="bar-props-release-header">
+              <span></span>
+              <span className="bar-props-release-col-label">Moment</span>
+              <span className="bar-props-release-col-label">Axial</span>
+              <span className="bar-props-release-col-label">Shear</span>
+            </div>
+            <div className="bar-props-release-row">
+              <span className="bar-props-release-row-label">Start</span>
+              <label className="bar-props-cb-cell">
+                <input type="checkbox" checked={startMomentRelease} onChange={e => setStartMomentRelease(e.target.checked)} />
+              </label>
+              <label className="bar-props-cb-cell">
+                <input type="checkbox" checked={startAxialRelease} onChange={e => setStartAxialRelease(e.target.checked)} />
+              </label>
+              <label className="bar-props-cb-cell">
+                <input type="checkbox" checked={startShearRelease} onChange={e => setStartShearRelease(e.target.checked)} />
+              </label>
+            </div>
+            <div className="bar-props-release-row">
+              <span className="bar-props-release-row-label">End</span>
+              <label className="bar-props-cb-cell">
+                <input type="checkbox" checked={endMomentRelease} onChange={e => setEndMomentRelease(e.target.checked)} />
+              </label>
+              <label className="bar-props-cb-cell">
+                <input type="checkbox" checked={endAxialRelease} onChange={e => setEndAxialRelease(e.target.checked)} />
+              </label>
+              <label className="bar-props-cb-cell">
+                <input type="checkbox" checked={endShearRelease} onChange={e => setEndShearRelease(e.target.checked)} />
+              </label>
+            </div>
           </div>
         </div>
         <div className="bar-props-footer">

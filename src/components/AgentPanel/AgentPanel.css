@@ -36,11 +36,59 @@
 .agent-panel-body {
   flex: 1;
   overflow-y: auto;
-  padding: 16px;
+  padding: 12px;
+}
+
+.agent-panel-body:has(.agent-panel-placeholder) {
   display: flex;
   align-items: center;
   justify-content: center;
 }
+
+.agent-messages {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.agent-msg {
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.agent-msg-label {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-bottom: 2px;
+}
+
+.agent-msg-user .agent-msg-label { color: var(--accent); }
+.agent-msg-assistant .agent-msg-label { color: var(--success); }
+
+.agent-msg-content {
+  color: var(--text-primary);
+  white-space: pre-wrap;
+  word-break: break-word;
+  background: var(--bg-tertiary);
+  border-radius: 6px;
+  padding: 8px 10px;
+}
+
+.agent-msg-user .agent-msg-content {
+  background: var(--accent-subtle);
+}
+
+.agent-loading {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-muted);
+}
+
+@keyframes spin { to { transform: rotate(360deg); } }
+.agent-spinner { animation: spin 1s linear infinite; }
 
 .agent-panel-placeholder {
   text-align: center;
@@ -100,4 +148,33 @@
 
 .agent-send-btn:hover:not(:disabled) {
   background: var(--accent-hover);
+}
+
+.agent-mic-btn {
+  background: transparent;
+  border: 1px solid var(--border-light);
+  color: var(--text-muted);
+  padding: 6px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  transition: all 0.15s;
+}
+
+.agent-mic-btn:hover {
+  color: var(--text-primary);
+  border-color: var(--text-secondary);
+}
+
+.agent-mic-btn.active {
+  background: #ef4444;
+  border-color: #ef4444;
+  color: #fff;
+  animation: pulse-mic 1.5s ease-in-out infinite;
+}
+
+@keyframes pulse-mic {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.7; }
 }

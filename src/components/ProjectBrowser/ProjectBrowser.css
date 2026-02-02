@@ -95,8 +95,9 @@
 }
 
 .browser-tab.active {
-  color: var(--accent);
+  color: var(--text-primary);
   border-bottom-color: var(--accent);
+  background: var(--accent-subtle);
 }
 
 /* Results LC Selector */
@@ -209,6 +210,16 @@
   background: var(--accent);
   color: #fff;
   border-left: 2px solid var(--accent);
+}
+
+.tree-item.selected .tree-label,
+.tree-item.selected .tree-info,
+.tree-item.selected .tree-count {
+  color: #fff;
+}
+
+.tree-item.selected .tree-arrow {
+  color: #fff;
 }
 
 .tree-item.result-option {

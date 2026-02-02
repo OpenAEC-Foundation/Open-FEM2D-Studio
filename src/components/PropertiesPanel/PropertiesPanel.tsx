@@ -1,8 +1,9 @@
 import { useFEM } from '../../context/FEMContext';
 import { formatModulus } from '../../core/fem/Material';
-import { formatStress, formatDisplacement, generateColorScale } from '../../utils/colors';
+import { formatStress, formatDisplacement, formatMomentPerLength, generateColorScale } from '../../utils/colors';
 import { formatForce, formatMoment } from '../../core/fem/BeamForces';
 import { DEFAULT_SECTIONS } from '../../core/fem/Beam';
+import { buildNodeIdToIndex } from '../../core/solver/Assembler';
 import './PropertiesPanel.css';
 
 // This component is now largely replaced by ProjectBrowser and VisibilityPanel
@@ -31,22 +32,14 @@ export function PropertiesPanel() {
   const selectedElement = selectedElementId ? mesh.getElement(selectedElementId) : null;
   const selectedBeam = selectedElementId ? mesh.getBeamElement(selectedElementId) : null;
 
-  const nodeIdToIndex = (() => {
-    const map = new Map<number, number>();
-    let index = 0;
-    for (const node of mesh.nodes.values()) {
-      map.set(node.id, index);
-      index++;
-    }
-    return map;
-  })();
+  const nodeIdToIndex = buildNodeIdToIndex(mesh, analysisType);
 
-  const dofsPerNode = analysisType === 'frame' ? 3 : 2;
+  const dofsPerNode = analysisType === 'frame' ? 3 : analysisType === 'plate_bending' ? 3 : 2;
 
   return (
     <div className="properties-panel">
       <div className="panel-section">
-        <h3>Instellingen</h3>
+        <h3>Settings</h3>
         <div className="form-group">
           <label>Grid (m)</label>
           <input
@@ -63,13 +56,13 @@ export function PropertiesPanel() {
             checked={snapToGrid}
             onChange={(e) => dispatch({ type: 'SET_SNAP_TO_GRID', payload: e.target.checked })}
           />
-          <label>Snap naar grid</label>
+          <label>Snap to Grid</label>
         </div>
       </div>
 
       {selectedNode && (
         <div className="panel-section">
-          <h3>Knoop #{selectedNode.id}</h3>
+          <h3>Node #{selectedNode.id}</h3>
           <div className="form-row">
             <div className="form-group">
               <label>X (m)</label>
@@ -97,7 +90,7 @@ export function PropertiesPanel() {
             </div>
           </div>
 
-          <h4>Oplegging</h4>
+          <h4>Support</h4>
           <div className="constraint-grid">
             <div className="checkbox-group">
               <input
@@ -137,12 +130,12 @@ export function PropertiesPanel() {
                     dispatch({ type: 'REFRESH_MESH' });
                   }}
                 />
-                <label>Rotatie</label>
+                <label>Rotation</label>
               </div>
             )}
           </div>
 
-          <h4>Belasting</h4>
+          <h4>Loads</h4>
           <div className="form-row">
             <div className="form-group">
               <label>Fx (kN)</label>
@@ -192,7 +185,7 @@ export function PropertiesPanel() {
 
           {result && (
             <div className="result-info">
-              <h4>Resultaten</h4>
+              <h4>Results</h4>
               <p>
                 <strong>u:</strong> {formatDisplacement(result.displacements[nodeIdToIndex.get(selectedNode.id)! * dofsPerNode] || 0)}
               </p>
@@ -211,9 +204,9 @@ export function PropertiesPanel() {
 
       {selectedBeam && (
         <div className="panel-section">
-          <h3>Balk #{selectedBeam.id}</h3>
+          <h3>Beam #{selectedBeam.id}</h3>
           <div className="form-group">
-            <label>Materiaal</label>
+            <label>Material</label>
             <select
               value={selectedBeam.materialId}
               onChange={(e) => {
@@ -228,7 +221,7 @@ export function PropertiesPanel() {
           </div>
 
           <div className="form-group">
-            <label>Profiel</label>
+            <label>Section Profile</label>
             <select
               value={`${selectedBeam.section.A.toExponential(2)}`}
               onChange={(e) => {
@@ -245,7 +238,7 @@ export function PropertiesPanel() {
             </select>
           </div>
 
-          <h4>Q-last (kN/m)</h4>
+          <h4>Distributed Load (kN/m)</h4>
           <div className="form-row">
             <div className="form-group">
               <label>qx</label>
@@ -283,7 +276,7 @@ export function PropertiesPanel() {
 
           {result && result.beamForces.has(selectedBeam.id) && (
             <div className="result-info">
-              <h4>Krachtsverdeling</h4>
+              <h4>Internal Forces</h4>
               {(() => {
                 const forces = result.beamForces.get(selectedBeam.id)!;
                 return (
@@ -303,7 +296,7 @@ export function PropertiesPanel() {
         <div className="panel-section">
           <h3>Element #{selectedElement.id}</h3>
           <div className="form-group">
-            <label>Materiaal</label>
+            <label>Material</label>
             <select
               value={selectedElement.materialId}
               onChange={(e) => {
@@ -317,7 +310,7 @@ export function PropertiesPanel() {
             </select>
           </div>
           <div className="form-group">
-            <label>Dikte (m)</label>
+            <label>Thickness (m)</label>
             <input
               type="number"
               value={selectedElement.thickness}
@@ -332,9 +325,18 @@ export function PropertiesPanel() {
 
           {result && result.elementStresses.has(selectedElement.id) && (
             <div className="result-info">
-              <h4>Spanningen</h4>
+              <h4>{analysisType === 'plate_bending' ? 'Moments' : 'Stresses'}</h4>
               {(() => {
                 const stress = result.elementStresses.get(selectedElement.id)!;
+                if (analysisType === 'plate_bending') {
+                  return (
+                    <>
+                      <p><strong>mx:</strong> {formatMomentPerLength(stress.mx ?? 0)}</p>
+                      <p><strong>my:</strong> {formatMomentPerLength(stress.my ?? 0)}</p>
+                      <p><strong>mxy:</strong> {formatMomentPerLength(stress.mxy ?? 0)}</p>
+                    </>
+                  );
+                }
                 return (
                   <>
                     <p><strong>sigma_x:</strong> {formatStress(stress.sigmaX)}</p>
@@ -351,17 +353,17 @@ export function PropertiesPanel() {
 
       {result && (
         <div className="panel-section">
-          <h3>Visualisatie</h3>
+          <h3>Visualization</h3>
           <div className="checkbox-group">
             <input
               type="checkbox"
               checked={showDeformed}
               onChange={(e) => dispatch({ type: 'SET_SHOW_DEFORMED', payload: e.target.checked })}
             />
-            <label>Vervorming tonen</label>
+            <label>Show Deformed</label>
           </div>
           <div className="form-group">
-            <label>Schaal vervorming</label>
+            <label>Deformation Scale</label>
             <input
               type="range"
               min="1"
@@ -374,7 +376,7 @@ export function PropertiesPanel() {
 
           {analysisType === 'frame' && (
             <div className="form-group">
-              <label>Diagram schaal</label>
+              <label>Diagram Scale</label>
               <input
                 type="range"
                 min="10"
@@ -394,7 +396,7 @@ export function PropertiesPanel() {
                   checked={showStress}
                   onChange={(e) => dispatch({ type: 'SET_SHOW_STRESS', payload: e.target.checked })}
                 />
-                <label>Spanningen tonen</label>
+                <label>Show Stresses</label>
               </div>
               <div className="form-group">
                 <label>Component</label>
@@ -402,13 +404,23 @@ export function PropertiesPanel() {
                   value={stressType}
                   onChange={(e) => dispatch({
                     type: 'SET_STRESS_TYPE',
-                    payload: e.target.value as 'vonMises' | 'sigmaX' | 'sigmaY' | 'tauXY'
+                    payload: e.target.value as any
                   })}
                 >
-                  <option value="vonMises">Von Mises</option>
-                  <option value="sigmaX">sigma_x</option>
-                  <option value="sigmaY">sigma_y</option>
-                  <option value="tauXY">tau_xy</option>
+                  {analysisType === 'plate_bending' ? (
+                    <>
+                      <option value="mx">mx (bending)</option>
+                      <option value="my">my (bending)</option>
+                      <option value="mxy">mxy (twist)</option>
+                    </>
+                  ) : (
+                    <>
+                      <option value="vonMises">Von Mises</option>
+                      <option value="sigmaX">sigma_x</option>
+                      <option value="sigmaY">sigma_y</option>
+                      <option value="tauXY">tau_xy</option>
+                    </>
+                  )}
                 </select>
               </div>
 
@@ -434,7 +446,7 @@ export function PropertiesPanel() {
 
       {result && analysisType === 'frame' && (
         <div className="panel-section">
-          <h3>Reactiekrachten</h3>
+          <h3>Reactions</h3>
           {Array.from(mesh.nodes.values())
             .filter(n => n.constraints.x || n.constraints.y || n.constraints.rotation)
             .map(node => {
@@ -447,7 +459,7 @@ export function PropertiesPanel() {
 
               return (
                 <div key={node.id} className="reaction-item">
-                  <strong>Knoop {node.id}:</strong>
+                  <strong>Node {node.id}:</strong>
                   {node.constraints.x && <span> Rx = {formatForce(Rx)}</span>}
                   {node.constraints.y && <span> Ry = {formatForce(Ry)}</span>}
                   {node.constraints.rotation && <span> Rm = {formatMoment(Rm)}</span>}
@@ -458,7 +470,7 @@ export function PropertiesPanel() {
       )}
 
       <div className="panel-section">
-        <h3>Materialen</h3>
+        <h3>Materials</h3>
         {Array.from(mesh.materials.values()).slice(0, 5).map(m => (
           <div key={m.id} className="material-item">
             <div

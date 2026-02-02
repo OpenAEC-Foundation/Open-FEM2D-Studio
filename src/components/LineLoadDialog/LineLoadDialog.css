@@ -125,3 +125,42 @@
 .line-load-btn.confirm:hover {
   background: var(--accent-hover);
 }
+
+.line-load-variable-section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.line-load-variable-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding-top: 4px;
+  border-top: 1px solid var(--border);
+}
+
+.line-load-lock-btn {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 8px;
+  border: 1px solid var(--border-light);
+  border-radius: 4px;
+  background: var(--bg-tertiary);
+  color: var(--text-muted);
+  font-size: 10px;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.line-load-lock-btn:hover {
+  color: var(--text-primary);
+  border-color: var(--text-secondary);
+}
+
+.line-load-lock-btn.unlocked {
+  background: var(--accent-subtle);
+  border-color: var(--accent);
+  color: var(--accent);
+}
