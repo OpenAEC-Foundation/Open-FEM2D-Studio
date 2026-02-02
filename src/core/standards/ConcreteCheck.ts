@@ -42,6 +42,14 @@ export interface IConcreteSection {
   cover: number;    // Concrete cover (mm)
 }
 
+export interface ICrackWidthResult {
+  wk: number;        // Calculated crack width (mm)
+  srMax: number;     // Maximum crack spacing (mm)
+  epsSmCm: number;   // (εsm - εcm) strain difference
+  sigmaS: number;    // Steel stress (MPa)
+  wkLimit: number;   // Limiting crack width (mm) — typically 0.3 for XC1
+}
+
 export interface IConcreteCheckResult {
   elementId: number;
   // Design moment
@@ -56,6 +64,8 @@ export interface IConcreteCheckResult {
   // Shear check
   VRdc: number;      // Concrete shear resistance (N) without reinforcement
   shearOk: boolean;  // VEd <= VRdc
+  // Crack width check (EN 1992-1-1 §7.3.4)
+  crackWidth: ICrackWidthResult | null;
   // Status
   UC_M: number;      // μ / 0.295 (ductility limit for NL)
   status: 'OK' | 'WARN' | 'FAIL';
@@ -134,6 +144,9 @@ export function checkConcreteSection(
     notes = notes || 'High utilization — consider larger section';
   }
 
+  // Crack width calculation per EN 1992-1-1 §7.3.4
+  const crackWidth = calculateCrackWidth(section, AsDesign, MEd, concrete, rebar);
+
   return {
     elementId: beamForces.elementId,
     MEd,
@@ -145,9 +158,90 @@ export function checkConcreteSection(
     AsProvided,
     VRdc,
     shearOk,
+    crackWidth,
     UC_M,
     status,
     notes,
+  };
+}
+
+/**
+ * Crack width calculation per EN 1992-1-1 §7.3.4
+ *
+ * wk = sr,max × (εsm - εcm)
+ *
+ * sr,max = 3.4c + 0.425 k1 k2 φ / ρp,eff  (simplified, Eq. 7.11)
+ * εsm - εcm = [σs - kt × fct,eff / ρp,eff × (1 + αe × ρp,eff)] / Es
+ *             but ≥ 0.6 σs / Es                                (Eq. 7.9)
+ *
+ * Typical values: k1=0.8 (high bond), k2=0.5 (bending), kt=0.4 (long-term)
+ */
+function calculateCrackWidth(
+  section: IConcreteSection,
+  asMm2: number,
+  MEd: number,
+  concrete: IConcreteGrade,
+  rebar: IReinforcementGrade,
+): ICrackWidthResult | null {
+  if (asMm2 <= 0 || MEd <= 0) return null;
+
+  const { b, d, cover } = section;
+  const c = cover; // mm
+  const EsMPa = rebar.Es * 1000; // GPa → MPa
+  const fctEff = concrete.fctm;  // MPa (use fctm as fct,eff)
+  const EcmMPa = concrete.Ecm * 1000; // GPa → MPa
+
+  // Modular ratio αe = Es / Ecm
+  const alphaE = EsMPa / EcmMPa;
+
+  // Effective reinforcement ratio
+  // Ac,eff = b × hc,eff where hc,eff = min(2.5(h-d), (h-x)/3, h/2)
+  // Simplified: use hc,eff = 2.5 × (h - d) as typical for beams
+  const h = section.h * 1000; // m → mm
+  const dMm = d * 1000;       // m → mm
+  const hcEff = Math.min(2.5 * (h - dMm), h / 2);
+  const bMm = b * 1000;       // m → mm
+  const AcEff = bMm * hcEff;  // mm²
+
+  if (AcEff <= 0) return null;
+
+  const rhoPEff = asMm2 / AcEff;
+  if (rhoPEff <= 0) return null;
+
+  // Steel stress under quasi-permanent loading (simplified: assume σs = MEd / (As × z))
+  // z ≈ 0.9d for typical reinforced concrete beams
+  const z = 0.9 * dMm; // mm
+  // MEd is in N·m, convert: N·m × 1000 = N·mm; As in mm², z in mm => result in MPa
+  const sigmaS_MPa = (MEd * 1000) / (asMm2 * z);
+
+  // Assumed bar diameter — estimate from As and typical bar counts
+  const phiGuess = Math.max(8, Math.min(32, Math.sqrt(4 * asMm2 / (Math.PI * 3)))); // assume ~3 bars
+
+  // k1 = 0.8 (high-bond bars), k2 = 0.5 (bending), kt = 0.4 (long-term)
+  const k1 = 0.8;
+  const k2 = 0.5;
+  const kt = 0.4;
+
+  // Maximum crack spacing (Eq. 7.11)
+  const srMax = 3.4 * c + 0.425 * k1 * k2 * phiGuess / rhoPEff; // mm
+
+  // Mean strain difference (Eq. 7.9)
+  const term1 = sigmaS_MPa - kt * (fctEff / rhoPEff) * (1 + alphaE * rhoPEff);
+  const term2 = 0.6 * sigmaS_MPa;
+  const epsSmCm = Math.max(term1, term2) / EsMPa;
+
+  // Crack width
+  const wk = srMax * epsSmCm; // mm
+
+  // Typical limit for XC1 exposure: 0.3 mm
+  const wkLimit = 0.3;
+
+  return {
+    wk: Math.max(0, wk),
+    srMax,
+    epsSmCm,
+    sigmaS: sigmaS_MPa,
+    wkLimit,
   };
 }
 

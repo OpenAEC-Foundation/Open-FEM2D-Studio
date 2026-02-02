@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { useFEM } from '../../context/FEMContext';
 import { applyLoadCaseToMesh } from '../../context/FEMContext';
 import { Tool, AnalysisType } from '../../core/fem/types';
@@ -10,20 +10,21 @@ import { STEEL_GRADES } from '../../core/standards/EurocodeNL';
 import { checkSteelSection } from '../../core/standards/SteelCheck';
 import { calculateBeamLength } from '../../core/fem/Beam';
 import {
-  MousePointer2, Hand, Minus, CircleDot,
+  MousePointer2, Hand, CircleDot,
   Triangle, ArrowLeftFromLine, Circle, ArrowDownUp, RotateCcw, ArrowLeftRight, Square,
   ArrowDown, Trash2, Move, Thermometer,
   Play, FastForward, CheckCircle,
-  BarChart3, FileText, Copy,
+  FileText, Copy,
   Undo2, Redo2, Layers, Combine,
-  Settings, Info, Download, Save, FolderOpen, Grid3X3, Bot, Box
+  Settings, Info, Download, Save, FolderOpen, Grid3X3, Bot, Box,
+  Sun, Moon, Maximize2
 } from 'lucide-react';
 import { serializeProject } from '../../core/io/ProjectSerializer';
 import { deserializeProject } from '../../core/io/ProjectSerializer';
 import { Mesh } from '../../core/fem/Mesh';
 import './Ribbon.css';
 
-type RibbonTab = 'home' | 'settings' | 'standards' | '3d' | 'results' | 'code-check';
+type RibbonTab = 'home' | 'settings' | 'standards' | '3d' | 'code-check';
 
 interface RibbonProps {
   onShowLoadCaseDialog?: () => void;
@@ -33,24 +34,36 @@ interface RibbonProps {
   onShowGridsDialog?: () => void;
   onShowSteelCheck?: () => void;
   onShowConcreteCheck?: () => void;
+  onShowMaterialsDialog?: () => void;
+  onShowCalculationSettings?: () => void;
   onToggleAgent?: () => void;
   showAgentPanel?: boolean;
 }
 
-export function Ribbon({ onShowLoadCaseDialog, onShowCombinationDialog, onShowProjectInfoDialog, onShowStandardsDialog, onShowGridsDialog, onShowSteelCheck, onShowConcreteCheck, onToggleAgent, showAgentPanel }: RibbonProps) {
+export function Ribbon({ onShowLoadCaseDialog, onShowCombinationDialog, onShowProjectInfoDialog, onShowStandardsDialog, onShowGridsDialog, onShowSteelCheck, onShowConcreteCheck, onShowMaterialsDialog, onShowCalculationSettings, onToggleAgent, showAgentPanel }: RibbonProps) {
   const { state, dispatch } = useFEM();
   const { selectedTool, mesh, analysisType, undoStack, redoStack, loadCases, activeLoadCase,
-    result, showDeformed, showReactions, showMoment, showShear, showNormal, diagramScale,
-    loadCombinations, activeCombination, showEnvelope, deformationScale, codeCheckBeamId } = state;
+    result, codeCheckBeamId } = state;
   const [activeTab, setActiveTab] = useState<RibbonTab>('home');
   const [solving, setSolving] = useState(false);
+  const [theme, setTheme] = useState<'dark' | 'light'>(() => {
+    const stored = localStorage.getItem('fem2d-theme');
+    return (stored === 'light' || stored === 'dark') ? stored : 'dark';
+  });
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    localStorage.setItem('fem2d-theme', theme);
+  }, [theme]);
+
+  const toggleTheme = () => {
+    setTheme(prev => prev === 'dark' ? 'light' : 'dark');
+  };
 
   const handleTabClick = (tab: RibbonTab) => {
     setActiveTab(tab);
     if (tab === '3d') {
       dispatch({ type: 'SET_VIEW_MODE', payload: '3d' });
-    } else if (tab === 'results') {
-      dispatch({ type: 'SET_VIEW_MODE', payload: 'results' });
     } else if (state.viewMode === '3d') {
       dispatch({ type: 'SET_VIEW_MODE', payload: 'geometry' });
     } else if (state.viewMode === 'results' && tab !== 'code-check') {
@@ -82,6 +95,14 @@ export function Ribbon({ onShowLoadCaseDialog, onShowCombinationDialog, onShowPr
       if (analysisType === 'frame') {
         dispatch({ type: 'SET_SHOW_MOMENT', payload: true });
       }
+      if (analysisType === 'plane_stress' || analysisType === 'plane_strain') {
+        dispatch({ type: 'SET_SHOW_STRESS', payload: true });
+        dispatch({ type: 'SET_STRESS_TYPE', payload: 'vonMises' });
+      }
+      if (analysisType === 'plate_bending') {
+        dispatch({ type: 'SET_SHOW_STRESS', payload: true });
+        dispatch({ type: 'SET_STRESS_TYPE', payload: 'mx' });
+      }
     } catch (e) {
       alert(`Solver error: ${(e as Error).message}`);
     } finally {
@@ -89,14 +110,68 @@ export function Ribbon({ onShowLoadCaseDialog, onShowCombinationDialog, onShowPr
     }
   };
 
+  const handleZoomToFit = () => {
+    const nodes = Array.from(mesh.nodes.values());
+    if (nodes.length === 0) return;
+
+    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+    for (const node of nodes) {
+      if (node.x < minX) minX = node.x;
+      if (node.x > maxX) maxX = node.x;
+      if (node.y < minY) minY = node.y;
+      if (node.y > maxY) maxY = node.y;
+    }
+
+    // If all nodes at same point, use a default range
+    if (maxX - minX < 0.001) { minX -= 1; maxX += 1; }
+    if (maxY - minY < 0.001) { minY -= 1; maxY += 1; }
+
+    const { width: canvasW, height: canvasH } = state.canvasSize;
+    const padding = 0.1; // 10% padding
+    const availW = canvasW * (1 - 2 * padding);
+    const availH = canvasH * (1 - 2 * padding);
+
+    const rangeX = maxX - minX;
+    const rangeY = maxY - minY;
+
+    const scaleX = availW / rangeX;
+    const scaleY = availH / rangeY;
+    const newScale = Math.min(scaleX, scaleY);
+
+    // Center of the bounding box in world coords
+    const centerX = (minX + maxX) / 2;
+    const centerY = (minY + maxY) / 2;
+
+    // Pan so that center of bounding box maps to center of canvas
+    // screenX = worldX * scale + offsetX  =>  offsetX = screenCenterX - centerX * scale
+    // screenY = -worldY * scale + offsetY  =>  offsetY = screenCenterY + centerY * scale
+    const offsetX = canvasW / 2 - centerX * newScale;
+    const offsetY = canvasH / 2 + centerY * newScale;
+
+    dispatch({ type: 'SET_VIEW_STATE', payload: { scale: newScale, offsetX, offsetY } });
+  };
+
+  const loadTools: Tool[] = ['addLoad', 'addLineLoad', 'addEdgeLoad', 'addThermalLoad'];
+
   const selectTool = (tool: Tool) => {
     dispatch({ type: 'SET_TOOL', payload: tool });
+    // Auto-switch to loads view when selecting a load tool
+    if (loadTools.includes(tool) && state.viewMode !== 'loads') {
+      dispatch({ type: 'SET_VIEW_MODE', payload: 'loads' });
+    }
   };
 
   const handleExportIfc = () => {
     const content = exportToIfc(mesh, state.projectInfo, loadCases);
     const filename = (state.projectInfo.name || 'project').replace(/\s+/g, '-').toLowerCase() + '.ifc';
     downloadIfc(content, filename);
+  };
+
+  const handleImportIfc = () => {
+    // Switch to 3D view and dispatch a custom event that Preview3D listens for
+    dispatch({ type: 'SET_VIEW_MODE', payload: '3d' });
+    setActiveTab('3d');
+    window.dispatchEvent(new CustomEvent('fem2d-import-ifc'));
   };
 
   const handleGenerateReport = () => {
@@ -169,7 +244,7 @@ export function Ribbon({ onShowLoadCaseDialog, onShowCombinationDialog, onShowPr
         mesh: newMesh,
         loadCases: [{ id: 1, name: 'Dead Load (G)', type: 'dead' as const, pointLoads: [], distributedLoads: [], edgeLoads: [], thermalLoads: [], color: '#6b7280' }],
         loadCombinations: [],
-        projectInfo: { name: 'New Project', engineer: '', company: '', date: new Date().toISOString().slice(0, 10), description: '', notes: '', location: '' },
+        projectInfo: { name: 'New Project', projectNumber: '', engineer: '', company: '', date: new Date().toISOString().slice(0, 10), description: '', notes: '', location: '' },
       }});
     }
   };
@@ -195,13 +270,6 @@ export function Ribbon({ onShowLoadCaseDialog, onShowCombinationDialog, onShowPr
           onClick={() => handleTabClick('standards')}
         >
           Standards
-        </button>
-        <button
-          className={`ribbon-tab ${activeTab === 'results' ? 'active' : ''}`}
-          onClick={() => handleTabClick('results')}
-        >
-          <BarChart3 size={14} style={{ marginRight: 4 }} />
-          Results
         </button>
         <button
           className={`ribbon-tab ${activeTab === '3d' ? 'active' : ''}`}
@@ -267,7 +335,13 @@ export function Ribbon({ onShowLoadCaseDialog, onShowCombinationDialog, onShowPr
                   onClick={() => selectTool('addBeam')}
                   title="Draw Bar (B)"
                 >
-                  <span className="ribbon-icon"><Minus size={14} /></span>
+                  <span className="ribbon-icon">
+                    <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.5">
+                      <circle cx="3" cy="7" r="2.5" />
+                      <line x1="5.5" y1="7" x2="8.5" y2="7" />
+                      <circle cx="11" cy="7" r="2.5" />
+                    </svg>
+                  </span>
                   <span>Bar</span>
                 </button>
                 <button
@@ -309,6 +383,14 @@ export function Ribbon({ onShowLoadCaseDialog, onShowCombinationDialog, onShowPr
                 >
                   <span className="ribbon-icon"><Grid3X3 size={14} /></span>
                   <span>Grids</span>
+                </button>
+                <button
+                  className="ribbon-button small"
+                  onClick={handleZoomToFit}
+                  title="Zoom to Fit (F)"
+                >
+                  <span className="ribbon-icon"><Maximize2 size={14} /></span>
+                  <span>Fit</span>
                 </button>
               </div>
             </div>
@@ -383,7 +465,7 @@ export function Ribbon({ onShowLoadCaseDialog, onShowCombinationDialog, onShowPr
             {/* Loads */}
             <div className="ribbon-group">
               <div className="ribbon-group-title">Loads</div>
-              <div className="ribbon-group-content grid-3x2">
+              <div className="ribbon-group-content grid-4x2">
                 <button
                   className={`ribbon-button small ${selectedTool === 'addLineLoad' ? 'active' : ''}`}
                   onClick={() => selectTool('addLineLoad')}
@@ -541,6 +623,14 @@ export function Ribbon({ onShowLoadCaseDialog, onShowCombinationDialog, onShowPr
                   <span className="ribbon-icon"><Info size={14} /></span>
                   <span>Project Info</span>
                 </button>
+                <button
+                  className="ribbon-button small"
+                  onClick={onShowMaterialsDialog}
+                  title="Manage Materials"
+                >
+                  <span className="ribbon-icon"><Layers size={14} /></span>
+                  <span>Materials</span>
+                </button>
               </div>
             </div>
 
@@ -571,6 +661,14 @@ export function Ribbon({ onShowLoadCaseDialog, onShowCombinationDialog, onShowPr
                   <span className="ribbon-icon"><FastForward size={14} /></span>
                   <span>{solving ? 'Solving...' : 'P-Delta'}</span>
                 </button>
+                <label className="ribbon-toggle" title="Auto-recalculate on model changes">
+                  <input
+                    type="checkbox"
+                    checked={state.autoRecalculate}
+                    onChange={(e) => dispatch({ type: 'SET_AUTO_RECALCULATE', payload: e.target.checked })}
+                  />
+                  <span>Auto</span>
+                </label>
                 <button
                   className="ribbon-button small"
                   onClick={() => {
@@ -585,22 +683,13 @@ export function Ribbon({ onShowLoadCaseDialog, onShowCombinationDialog, onShowPr
                   <span className="ribbon-icon"><CheckCircle size={14} /></span>
                   <span>Run Tests</span>
                 </button>
-              </div>
-            </div>
-
-            <div className="ribbon-separator" />
-
-            {/* Reports */}
-            <div className="ribbon-group">
-              <div className="ribbon-group-title">Reports</div>
-              <div className="ribbon-group-content">
-                <button className="ribbon-button small" title="Results Table">
-                  <span className="ribbon-icon"><BarChart3 size={14} /></span>
-                  <span>Table</span>
-                </button>
-                <button className="ribbon-button small" title="Export PDF">
-                  <span className="ribbon-icon"><FileText size={14} /></span>
-                  <span>PDF</span>
+                <button
+                  className="ribbon-button small"
+                  onClick={onShowCalculationSettings}
+                  title="Calculation Settings"
+                >
+                  <span className="ribbon-icon"><Settings size={14} /></span>
+                  <span>Calc Settings</span>
                 </button>
               </div>
             </div>
@@ -622,140 +711,23 @@ export function Ribbon({ onShowLoadCaseDialog, onShowCombinationDialog, onShowPr
               </div>
             </div>
 
-          </>
-        )}
-
-        {activeTab === 'results' && (
-          <>
-            {/* Display */}
-            <div className="ribbon-group">
-              <div className="ribbon-group-title">Display</div>
-              <div className="ribbon-group-content wrap">
-                <label className="ribbon-toggle">
-                  <input
-                    type="checkbox"
-                    checked={showDeformed}
-                    onChange={(e) => dispatch({ type: 'SET_SHOW_DEFORMED', payload: e.target.checked })}
-                  />
-                  <span>Deformed</span>
-                </label>
-                <label className="ribbon-toggle">
-                  <input
-                    type="checkbox"
-                    checked={showReactions}
-                    onChange={(e) => dispatch({ type: 'SET_SHOW_REACTIONS', payload: e.target.checked })}
-                  />
-                  <span>Reactions</span>
-                </label>
-              </div>
-            </div>
-
             <div className="ribbon-separator" />
 
-            {/* Deformation Scale */}
+            {/* Appearance */}
             <div className="ribbon-group">
-              <div className="ribbon-group-title">Deformation Scale</div>
+              <div className="ribbon-group-title">Appearance</div>
               <div className="ribbon-group-content">
-                <input
-                  type="range"
-                  className="ribbon-range"
-                  min="1"
-                  max="1000"
-                  value={deformationScale}
-                  onChange={(e) => dispatch({ type: 'SET_DEFORMATION_SCALE', payload: parseInt(e.target.value) })}
-                />
-                <span className="ribbon-range-value">{deformationScale}x</span>
+                <button
+                  className="theme-toggle-btn"
+                  onClick={toggleTheme}
+                  title={theme === 'dark' ? 'Switch to Light Theme' : 'Switch to Dark Theme'}
+                >
+                  {theme === 'dark' ? <Sun size={14} /> : <Moon size={14} />}
+                  <span>{theme === 'dark' ? 'Light Mode' : 'Dark Mode'}</span>
+                </button>
               </div>
             </div>
 
-            <div className="ribbon-separator" />
-
-            {/* Diagrams */}
-            {analysisType === 'frame' && (
-              <>
-                <div className="ribbon-group">
-                  <div className="ribbon-group-title">Diagrams</div>
-                  <div className="ribbon-group-content wrap">
-                    <label className="ribbon-toggle" style={{ color: '#ef4444' }}>
-                      <input
-                        type="checkbox"
-                        checked={showMoment}
-                        onChange={(e) => dispatch({ type: 'SET_SHOW_MOMENT', payload: e.target.checked })}
-                      />
-                      <span>M</span>
-                    </label>
-                    <label className="ribbon-toggle" style={{ color: '#3b82f6' }}>
-                      <input
-                        type="checkbox"
-                        checked={showShear}
-                        onChange={(e) => dispatch({ type: 'SET_SHOW_SHEAR', payload: e.target.checked })}
-                      />
-                      <span>V</span>
-                    </label>
-                    <label className="ribbon-toggle" style={{ color: '#22c55e' }}>
-                      <input
-                        type="checkbox"
-                        checked={showNormal}
-                        onChange={(e) => dispatch({ type: 'SET_SHOW_NORMAL', payload: e.target.checked })}
-                      />
-                      <span>N</span>
-                    </label>
-                  </div>
-                </div>
-
-                <div className="ribbon-separator" />
-
-                <div className="ribbon-group">
-                  <div className="ribbon-group-title">Diagram Scale</div>
-                  <div className="ribbon-group-content">
-                    <input
-                      type="range"
-                      className="ribbon-range"
-                      min="10"
-                      max="200"
-                      value={diagramScale}
-                      onChange={(e) => dispatch({ type: 'SET_DIAGRAM_SCALE', payload: parseInt(e.target.value) })}
-                    />
-                    <span className="ribbon-range-value">{diagramScale}</span>
-                  </div>
-                </div>
-
-                <div className="ribbon-separator" />
-              </>
-            )}
-
-            {/* Combinations */}
-            {loadCombinations.length > 0 && (
-              <div className="ribbon-group">
-                <div className="ribbon-group-title">Combinations</div>
-                <div className="ribbon-group-content">
-                  <select
-                    className="ribbon-select"
-                    value={activeCombination ?? ''}
-                    onChange={(e) => {
-                      const val = e.target.value;
-                      dispatch({
-                        type: 'SET_ACTIVE_COMBINATION',
-                        payload: val === '' ? null : parseInt(val)
-                      });
-                    }}
-                  >
-                    <option value="">Load Case</option>
-                    {loadCombinations.map(lc => (
-                      <option key={lc.id} value={lc.id}>{lc.name}</option>
-                    ))}
-                  </select>
-                  <label className="ribbon-toggle" style={{ color: '#f59e0b' }}>
-                    <input
-                      type="checkbox"
-                      checked={showEnvelope}
-                      onChange={(e) => dispatch({ type: 'SET_SHOW_ENVELOPE', payload: e.target.checked })}
-                    />
-                    <span>Envelope</span>
-                  </label>
-                </div>
-              </div>
-            )}
           </>
         )}
 
@@ -767,6 +739,18 @@ export function Ribbon({ onShowLoadCaseDialog, onShowCombinationDialog, onShowPr
                 <span style={{ color: 'var(--text-muted)', fontSize: 11, padding: '0 8px' }}>
                   3D visualization of the structure
                 </span>
+              </div>
+            </div>
+
+            <div className="ribbon-separator" />
+
+            <div className="ribbon-group">
+              <div className="ribbon-group-title">IFC</div>
+              <div className="ribbon-group-content">
+                <button className="ribbon-button small" onClick={handleImportIfc} title="Import IFC file into 3D view">
+                  <span className="ribbon-icon"><Download size={14} /></span>
+                  <span>Import IFC</span>
+                </button>
               </div>
             </div>
           </>

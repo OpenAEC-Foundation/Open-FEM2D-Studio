@@ -16,6 +16,13 @@
   box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
 }
 
+.bar-props-dialog-tabbed {
+  width: 400px;
+  max-height: 80vh;
+  display: flex;
+  flex-direction: column;
+}
+
 .bar-props-header {
   padding: 12px 16px;
   font-size: 13px;
@@ -26,11 +33,50 @@
   border-radius: 8px 8px 0 0;
 }
 
+/* Tab bar */
+.bar-props-tabs {
+  display: flex;
+  gap: 0;
+  background: var(--bg-dark, #0d1117);
+  border-bottom: 1px solid var(--border);
+}
+
+.bar-props-tab {
+  flex: 1;
+  padding: 8px 6px;
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+}
+
+.bar-props-tab:hover {
+  background: var(--bg-secondary);
+  color: var(--text-secondary);
+}
+
+.bar-props-tab.active {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+  background: var(--bg-secondary);
+}
+
 .bar-props-body {
   padding: 12px 16px;
   display: flex;
   flex-direction: column;
   gap: 6px;
+}
+
+.bar-props-body-scrollable {
+  overflow-y: auto;
+  max-height: 60vh;
 }
 
 .bar-props-row {
@@ -109,6 +155,23 @@
   outline: none;
   border-color: var(--accent);
   box-shadow: 0 0 0 2px var(--accent-subtle);
+}
+
+/* Select dropdown in dialog */
+.bar-props-select {
+  padding: 4px 8px;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-light);
+  border-radius: 4px;
+  color: var(--text-primary);
+  font-size: 11px;
+  font-family: monospace;
+  cursor: pointer;
+}
+
+.bar-props-select:focus {
+  outline: none;
+  border-color: var(--accent);
 }
 
 .bar-props-footer {
@@ -220,4 +283,136 @@
   width: 14px;
   height: 14px;
   accent-color: var(--accent);
+}
+
+/* ── EN 1993-1 Tab Styles ──────────────────────────────────── */
+
+/* Cross-section class badge */
+.bar-props-class {
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-weight: 700;
+  font-size: 11px;
+}
+
+.bar-props-class-1 {
+  background: #1a5c2a;
+  color: #4ade80;
+}
+
+.bar-props-class-2 {
+  background: #1a4a5c;
+  color: #67e8f9;
+}
+
+.bar-props-class-3 {
+  background: #5c4a1a;
+  color: #fbbf24;
+}
+
+.bar-props-class-4 {
+  background: #5c1a1a;
+  color: #f87171;
+}
+
+/* No results message */
+.bar-props-no-results {
+  font-size: 11px;
+  color: var(--text-muted);
+  font-style: italic;
+  padding: 12px 0;
+  text-align: center;
+}
+
+/* Status banner */
+.bar-props-status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 12px;
+  border-radius: 6px;
+  font-size: 12px;
+  font-weight: 700;
+  margin: 4px 0;
+}
+
+.bar-props-status.pass {
+  background: #0a2e1a;
+  color: #4ade80;
+  border: 1px solid #166534;
+}
+
+.bar-props-status.fail {
+  background: #2e0a0a;
+  color: #f87171;
+  border: 1px solid #991b1b;
+}
+
+.bar-props-status-governing {
+  font-weight: 400;
+  font-size: 10px;
+  opacity: 0.8;
+}
+
+/* Unity check table */
+.bar-props-uc-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 11px;
+  margin-top: 4px;
+}
+
+.bar-props-uc-table th {
+  padding: 4px 6px;
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+  text-align: left;
+  border-bottom: 1px solid var(--border);
+}
+
+.bar-props-uc-table th:last-child {
+  text-align: right;
+}
+
+.bar-props-uc-table td {
+  padding: 4px 6px;
+  color: var(--text-primary);
+  border-bottom: 1px solid var(--border);
+  font-family: monospace;
+}
+
+.bar-props-uc-table td:first-child {
+  font-family: inherit;
+  font-weight: 500;
+  color: var(--text-secondary);
+}
+
+.bar-props-uc-table td.uc-value {
+  text-align: right;
+  font-weight: 600;
+}
+
+.bar-props-uc-table tr.uc-fail td {
+  color: #f87171;
+}
+
+.bar-props-uc-table tr.uc-fail td.uc-value {
+  background: rgba(248, 113, 113, 0.1);
+}
+
+/* Scrollbar for body */
+.bar-props-body-scrollable::-webkit-scrollbar {
+  width: 6px;
+}
+
+.bar-props-body-scrollable::-webkit-scrollbar-track {
+  background: var(--bg-primary);
+}
+
+.bar-props-body-scrollable::-webkit-scrollbar-thumb {
+  background: var(--bg-tertiary);
+  border-radius: 3px;
 }

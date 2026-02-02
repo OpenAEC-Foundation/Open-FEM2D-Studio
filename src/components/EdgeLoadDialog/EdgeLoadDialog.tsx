@@ -2,10 +2,12 @@ import { useState } from 'react';
 import './EdgeLoadDialog.css';
 
 interface EdgeLoadDialogProps {
-  edge: 'top' | 'bottom' | 'left' | 'right';
+  edge: 'top' | 'bottom' | 'left' | 'right' | number;
   loadCases: { id: number; name: string }[];
   activeLoadCase: number;
-  onApply: (px: number, py: number, lcId: number, edge: 'top' | 'bottom' | 'left' | 'right') => void;
+  /** polygon vertices (provided when the plate is a polygon plate) */
+  polygon?: { x: number; y: number }[];
+  onApply: (px: number, py: number, lcId: number, edge: 'top' | 'bottom' | 'left' | 'right' | number) => void;
   onCancel: () => void;
 }
 
@@ -13,13 +15,16 @@ export function EdgeLoadDialog({
   edge,
   loadCases,
   activeLoadCase,
+  polygon,
   onApply,
   onCancel,
 }: EdgeLoadDialogProps) {
-  const [selectedEdge, setSelectedEdge] = useState<'top' | 'bottom' | 'left' | 'right'>(edge);
+  const [selectedEdge, setSelectedEdge] = useState<'top' | 'bottom' | 'left' | 'right' | number>(edge);
   const [px, setPx] = useState('0');
   const [py, setPy] = useState('-10');
   const [selectedLC, setSelectedLC] = useState(activeLoadCase);
+
+  const isPolygonMode = polygon && polygon.length >= 3;
 
   const handleApply = () => {
     const valPx = parseFloat(px);
@@ -32,6 +37,9 @@ export function EdgeLoadDialog({
     if (e.key === 'Enter') handleApply();
     if (e.key === 'Escape') onCancel();
   };
+
+  /** Format a coordinate value for display */
+  const fmtCoord = (v: number) => v.toFixed(2);
 
   return (
     <div className="edge-load-dialog-overlay" onClick={onCancel}>
@@ -53,13 +61,32 @@ export function EdgeLoadDialog({
           <label>
             <span>Edge</span>
             <select
-              value={selectedEdge}
-              onChange={e => setSelectedEdge(e.target.value as 'top' | 'bottom' | 'left' | 'right')}
+              value={typeof selectedEdge === 'number' ? selectedEdge.toString() : selectedEdge}
+              onChange={e => {
+                const v = e.target.value;
+                if (v === 'top' || v === 'bottom' || v === 'left' || v === 'right') {
+                  setSelectedEdge(v);
+                } else {
+                  setSelectedEdge(parseInt(v));
+                }
+              }}
             >
-              <option value="bottom">Bottom</option>
-              <option value="top">Top</option>
-              <option value="left">Left</option>
-              <option value="right">Right</option>
+              {isPolygonMode
+                ? polygon!.map((v, i) => {
+                    const next = polygon![(i + 1) % polygon!.length];
+                    return (
+                      <option key={i} value={i}>
+                        Edge {i} ({fmtCoord(v.x)},{fmtCoord(v.y)}) - ({fmtCoord(next.x)},{fmtCoord(next.y)})
+                      </option>
+                    );
+                  })
+                : <>
+                    <option value="bottom">Bottom</option>
+                    <option value="top">Top</option>
+                    <option value="left">Left</option>
+                    <option value="right">Right</option>
+                  </>
+              }
             </select>
           </label>
 
@@ -75,7 +102,7 @@ export function EdgeLoadDialog({
               />
             </label>
             <label>
-              <span>py (kN/m)</span>
+              <span>pz (kN/m)</span>
               <input
                 type="text"
                 value={py}
@@ -88,7 +115,7 @@ export function EdgeLoadDialog({
           </div>
 
           <p className="edge-load-hint">
-            Negative py = downward. Load is applied uniformly along the selected edge.
+            Negative pz = downward. Load is applied uniformly along the selected edge.
           </p>
         </div>
         <div className="edge-load-dialog-footer">

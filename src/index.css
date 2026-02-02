@@ -23,6 +23,41 @@
   --border: rgba(255, 255, 255, 0.06);
   --border-light: rgba(255, 255, 255, 0.10);
   --border-accent: rgba(59, 130, 246, 0.3);
+  /* Canvas-specific colors */
+  --canvas-bg: #1a1a2e;
+  --canvas-grid: #2a2a4a;
+  --canvas-axis: #4a4a6a;
+  --canvas-label-bg: rgba(26, 26, 46, 0.85);
+  --canvas-dim-color: #718096;
+  --canvas-baseline: #666666;
+}
+
+[data-theme="light"] {
+  --bg-dark: #f0f0f4;
+  --bg-primary: #ffffff;
+  --bg-secondary: #f5f5f7;
+  --bg-tertiary: #e8e8ec;
+  --bg-elevated: #dcdce0;
+  --text-primary: #1a1a2e;
+  --text-secondary: #4a4a6a;
+  --text-muted: #8a8aa0;
+  --accent: #3b82f6;
+  --accent-hover: #2563eb;
+  --accent-subtle: rgba(59, 130, 246, 0.10);
+  --success: #16a34a;
+  --success-hover: #15803d;
+  --warning: #ca8a04;
+  --danger: #dc2626;
+  --border: rgba(0, 0, 0, 0.08);
+  --border-light: rgba(0, 0, 0, 0.12);
+  --border-accent: rgba(59, 130, 246, 0.3);
+  /* Canvas-specific colors */
+  --canvas-bg: #f8f8fc;
+  --canvas-grid: #e0e0e8;
+  --canvas-axis: #b0b0c0;
+  --canvas-label-bg: rgba(255, 255, 255, 0.90);
+  --canvas-dim-color: #6b7280;
+  --canvas-baseline: #aaaaaa;
 }
 
 body {

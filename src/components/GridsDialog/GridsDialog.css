@@ -48,35 +48,62 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 8px 12px;
+  padding: 12px 14px;
   background: var(--bg-secondary);
-  font-size: 12px;
-  font-weight: 600;
+  font-size: 14px;
+  font-weight: 700;
   color: var(--text-primary);
+  letter-spacing: 0.3px;
+  border-bottom: 2px solid var(--accent);
 }
 
 .grids-section-actions {
   display: flex;
-  gap: 4px;
+  flex-direction: column;
+  gap: 2px;
 }
 
 .grids-action-btn {
   display: flex;
   align-items: center;
+  justify-content: center;
   gap: 3px;
-  padding: 3px 8px;
+  padding: 2px 8px;
   background: var(--bg-tertiary);
   border: 1px solid var(--border-light);
-  border-radius: 4px;
+  border-radius: 3px;
   color: var(--text-secondary);
   font-size: 11px;
   cursor: pointer;
+  min-width: 24px;
+  line-height: 1;
 }
 
 .grids-action-btn:hover {
   background: var(--accent);
   color: #fff;
   border-color: var(--accent);
+}
+
+.grids-action-btn.add-btn {
+  color: var(--text-primary);
+  font-weight: 700;
+}
+
+.grids-action-btn.remove-btn {
+  color: var(--text-muted);
+  font-weight: 700;
+}
+
+.grids-action-btn.remove-btn:hover {
+  background: var(--danger, #e74c3c);
+  color: #fff;
+  border-color: var(--danger, #e74c3c);
+}
+
+.grids-action-btn.distribute-btn {
+  font-size: 10px;
+  padding: 2px 6px;
 }
 
 .grids-table {
@@ -138,6 +165,56 @@
   text-align: center;
   color: var(--text-muted);
   font-size: 11px;
+}
+
+/* Spacing row between grid lines */
+.grids-spacing-row td {
+  padding: 0 8px !important;
+  border-bottom: none !important;
+}
+
+.grids-spacing-indicator {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 0;
+  cursor: pointer;
+  user-select: none;
+}
+
+.grids-spacing-line {
+  flex: 1;
+  height: 0;
+  border-top: 1px dashed var(--border-light);
+}
+
+.grids-spacing-label {
+  font-size: 10px;
+  color: var(--text-muted);
+  padding: 1px 6px;
+  border-radius: 3px;
+  white-space: nowrap;
+  background: var(--bg-secondary);
+  border: 1px solid transparent;
+  transition: all 0.15s ease;
+}
+
+.grids-spacing-indicator:hover .grids-spacing-label {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: var(--bg-tertiary);
+}
+
+.grids-spacing-input {
+  width: 70px;
+  padding: 1px 4px;
+  font-size: 10px;
+  text-align: center;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--accent);
+  border-radius: 3px;
+  color: var(--text-primary);
+  outline: none;
 }
 
 .grids-options {

@@ -95,9 +95,9 @@
 }
 
 .browser-tab.active {
-  color: var(--text-primary);
+  color: #fff;
   border-bottom-color: var(--accent);
-  background: var(--accent-subtle);
+  background: var(--accent);
 }
 
 /* Results LC Selector */

@@ -1,7 +1,7 @@
 import { useRef, useEffect, useCallback, useState } from 'react';
 import { useFEM, applyLoadCaseToMesh } from '../../context/FEMContext';
 import { INode, IBeamElement, IBeamSection } from '../../core/fem/types';
-import { getStressColor } from '../../utils/colors';
+import { getStressColor, generateColorScale, formatResultValue } from '../../utils/colors';
 import { calculateBeamLength, calculateBeamAngle } from '../../core/fem/Beam';
 import { formatForce, formatMoment } from '../../core/fem/BeamForces';
 import { SectionDialog } from '../SectionDialog/SectionDialog';
@@ -12,7 +12,8 @@ import { LineLoadDialog } from '../LineLoadDialog/LineLoadDialog';
 import { PlateDialog } from '../PlateDialog/PlateDialog';
 import { EdgeLoadDialog } from '../EdgeLoadDialog/EdgeLoadDialog';
 import { ThermalLoadDialog } from '../ThermalLoadDialog/ThermalLoadDialog';
-import { generatePlateRegionMesh, removePlateRegion } from '../../core/fem/PlateRegion';
+import { PlatePropertiesDialog } from '../PlatePropertiesDialog/PlatePropertiesDialog';
+import { generatePlateRegionMesh, generatePolygonPlateMesh, removePlateRegion, remeshPlateRegion, remeshPolygonPlateRegion, findPlateCornerForNode, pointInPolygon, polygonCentroid } from '../../core/fem/PlateRegion';
 import { buildNodeIdToIndex } from '../../core/solver/Assembler';
 import { checkSteelSection } from '../../core/standards/SteelCheck';
 import { STEEL_GRADES } from '../../core/standards/EurocodeNL';
@@ -54,7 +55,12 @@ export function MeshEditor() {
     showLoads,
     showNodeLabels,
     showMemberLabels,
-    forceUnit
+    forceUnit,
+    showDisplacements,
+    showDeflections,
+    autoRecalculate,
+    showEnvelope,
+    envelopeResult
   } = state;
 
   const [isDragging, setIsDragging] = useState(false);
@@ -88,15 +94,23 @@ export function MeshEditor() {
 
   // Line load input dialog
   const [lineLoadBeamId, setLineLoadBeamId] = useState<number | null>(null);
+  // When editing an existing distributed load (double-click), track its id
+  const [editingDistLoadId, setEditingDistLoadId] = useState<number | null>(null);
 
   // Node properties dialog (double-click on node)
   const [editingNodeId, setEditingNodeId] = useState<number | null>(null);
+
+  // Plate properties dialog (double-click on plate)
+  const [editingPlateId, setEditingPlateId] = useState<number | null>(null);
 
   // Hovered beam for line load / addLoad tool highlight
   const [hoveredBeamId, setHoveredBeamId] = useState<number | null>(null);
 
   // Hovered node for pre-highlight
   const [hoveredNodeId, setHoveredNodeId] = useState<number | null>(null);
+
+  // Tooltip mouse position (screen coords relative to container)
+  const [tooltipPos, setTooltipPos] = useState<{ x: number; y: number } | null>(null);
 
   // Line load shape handle resizing
   const [resizingLoadBeamId, setResizingLoadBeamId] = useState<number | null>(null);
@@ -124,9 +138,21 @@ export function MeshEditor() {
   const [showPlateDialog, setShowPlateDialog] = useState(false);
   const [pendingPlateRect, setPendingPlateRect] = useState<{x: number, y: number, w: number, h: number} | null>(null);
 
+  // Polygon plate drawing mode
+  const [plateDrawMode, setPlateDrawMode] = useState<'rectangle' | 'polygon'>('rectangle');
+  const [platePolygonPoints, setPlatePolygonPoints] = useState<{x: number, y: number}[]>([]);
+  const [plateVoids, setPlateVoids] = useState<{x: number, y: number}[][]>([]);
+  const [plateEditState, setPlateEditState] = useState<'outline' | 'void' | null>(null);
+  const [currentVoidPoints, setCurrentVoidPoints] = useState<{x: number, y: number}[]>([]);
+  const [pendingPolygonPlate, setPendingPolygonPlate] = useState<{
+    outline: {x: number, y: number}[];
+    voids: {x: number, y: number}[][];
+    bbox: {x: number, y: number, w: number, h: number};
+  } | null>(null);
+
   // Edge load dialog
   const [edgeLoadPlateId, setEdgeLoadPlateId] = useState<number | null>(null);
-  const [edgeLoadEdge, setEdgeLoadEdge] = useState<'top' | 'bottom' | 'left' | 'right'>('bottom');
+  const [edgeLoadEdge, setEdgeLoadEdge] = useState<'top' | 'bottom' | 'left' | 'right' | number>('bottom');
 
   // Thermal load dialog
   const [thermalLoadElementIds, setThermalLoadElementIds] = useState<number[]>([]);
@@ -271,10 +297,16 @@ export function MeshEditor() {
 
     for (const element of mesh.elements.values()) {
       const nodes = mesh.getElementNodes(element);
-      if (nodes.length !== 3) continue;
-
-      if (pointInTriangle(world, nodes[0], nodes[1], nodes[2])) {
-        return element.id;
+      if (nodes.length === 3) {
+        if (pointInTriangle(world, nodes[0], nodes[1], nodes[2])) {
+          return element.id;
+        }
+      } else if (nodes.length === 4) {
+        // Quad: test as two triangles (BL,BR,TR) and (BL,TR,TL)
+        if (pointInTriangle(world, nodes[0], nodes[1], nodes[2]) ||
+            pointInTriangle(world, nodes[0], nodes[2], nodes[3])) {
+          return element.id;
+        }
       }
     }
     return null;
@@ -449,51 +481,88 @@ export function MeshEditor() {
     return null;
   }, [mesh, worldToScreen]);
 
-  // Find distributed load at screen position
-  const findDistLoadAtScreen = useCallback((screenX: number, screenY: number): number | null => {
-    for (const beam of mesh.beamElements.values()) {
-      if (!beam.distributedLoad) continue;
-      const { qy } = beam.distributedLoad;
-      if (qy === 0) continue;
+  // Find distributed load at screen position — returns { beamId, loadId } for individual load selection
+  const findDistLoadAtScreen = useCallback((screenX: number, screenY: number): { beamId: number; loadId: number } | null => {
+    const activeLc = loadCases.find(lc => lc.id === activeLoadCase);
+    if (!activeLc) return null;
 
+    for (const beam of mesh.beamElements.values()) {
       const nodes = mesh.getBeamElementNodes(beam);
       if (!nodes) continue;
       const [n1, n2] = nodes;
 
       const p1 = worldToScreen(n1.x, n1.y);
       const p2 = worldToScreen(n2.x, n2.y);
-
       const screenAngle = Math.atan2(p2.y - p1.y, p2.x - p1.x);
-      const perpAngle = screenAngle + Math.PI / 2;
-      const arrowLength = Math.min(40, Math.abs(qy) / 500 * 40 + 20);
-      const sign = qy > 0 ? 1 : -1;
 
-      // Check if click is between the beam line and the arrow tops
-      // Build bounding polygon: p1, p2, endTop, startTop
-      const startTop = {
-        x: p1.x + Math.cos(perpAngle) * arrowLength * sign,
-        y: p1.y + Math.sin(perpAngle) * arrowLength * sign
-      };
-      const endTop = {
-        x: p2.x + Math.cos(perpAngle) * arrowLength * sign,
-        y: p2.y + Math.sin(perpAngle) * arrowLength * sign
-      };
+      const beamLoads = activeLc.distributedLoads.filter(dl => dl.elementId === beam.id);
+      if (beamLoads.length === 0) continue;
 
-      // Simple check: point-to-segment distance for both beam line and top line
-      const distToBeam = pointToSegmentDist(screenX, screenY, p1.x, p1.y, p2.x, p2.y);
-      const distToTop = pointToSegmentDist(screenX, screenY, startTop.x, startTop.y, endTop.x, endTop.y);
+      // Iterate loads in reverse draw order (topmost first) so topmost load gets picked first
+      let cumulativeOffset = 0;
+      const loadBands: { loadId: number; offsetStart: number; offsetEnd: number; perpAngle: number; startT: number; endT: number }[] = [];
+      for (const dl of beamLoads) {
+        if (dl.qx === 0 && dl.qy === 0 && (dl.qyEnd ?? dl.qy) === 0) continue;
+        const qy = dl.qy;
+        const qyE = dl.qyEnd ?? qy;
+        const coordSystem = dl.coordSystem ?? 'local';
+        const isGlobal = coordSystem === 'global';
+        const perpAngle = isGlobal ? Math.PI / 2 : screenAngle + Math.PI / 2;
+        const maxQ = Math.max(Math.abs(qy), Math.abs(qyE));
+        const baseLen = Math.min(40, maxQ / 500 * 40 + 20);
+        const arrowHeight = Math.max(Math.abs(qy) / maxQ, Math.abs(qyE) / maxQ) * baseLen;
 
-      // Skip if click is right on the beam line (within 5px) - let beam handler take priority
-      if (distToBeam < 5) continue;
+        loadBands.push({
+          loadId: dl.id ?? 0,
+          offsetStart: cumulativeOffset,
+          offsetEnd: cumulativeOffset + arrowHeight,
+          perpAngle,
+          startT: dl.startT ?? 0,
+          endT: dl.endT ?? 1
+        });
+        cumulativeOffset += arrowHeight + 4;
+      }
 
-      if (distToBeam < arrowLength + 5 && distToTop < arrowLength + 5 &&
-          (distToBeam < 10 || distToTop < 10 ||
-           (distToBeam < arrowLength && distToTop < arrowLength))) {
-        return beam.id;
+      // Check in reverse order (topmost load first for proper z-order hit testing)
+      for (let i = loadBands.length - 1; i >= 0; i--) {
+        const band = loadBands[i];
+        // Compute the band region in screen space
+        const loadP1base = {
+          x: p1.x + (p2.x - p1.x) * band.startT + Math.cos(band.perpAngle) * band.offsetStart,
+          y: p1.y + (p2.y - p1.y) * band.startT + Math.sin(band.perpAngle) * band.offsetStart
+        };
+        const loadP2base = {
+          x: p1.x + (p2.x - p1.x) * band.endT + Math.cos(band.perpAngle) * band.offsetStart,
+          y: p1.y + (p2.y - p1.y) * band.endT + Math.sin(band.perpAngle) * band.offsetStart
+        };
+        const loadP1top = {
+          x: p1.x + (p2.x - p1.x) * band.startT + Math.cos(band.perpAngle) * band.offsetEnd,
+          y: p1.y + (p2.y - p1.y) * band.startT + Math.sin(band.perpAngle) * band.offsetEnd
+        };
+        const loadP2top = {
+          x: p1.x + (p2.x - p1.x) * band.endT + Math.cos(band.perpAngle) * band.offsetEnd,
+          y: p1.y + (p2.y - p1.y) * band.endT + Math.sin(band.perpAngle) * band.offsetEnd
+        };
+
+        const distToBase = pointToSegmentDist(screenX, screenY, loadP1base.x, loadP1base.y, loadP2base.x, loadP2base.y);
+        const distToTop = pointToSegmentDist(screenX, screenY, loadP1top.x, loadP1top.y, loadP2top.x, loadP2top.y);
+        const bandHeight = band.offsetEnd - band.offsetStart;
+
+        // Skip if click is right on the beam line (within 5px) for first load — let beam handler take priority
+        if (i === 0 && band.offsetStart === 0) {
+          const distToBeam = pointToSegmentDist(screenX, screenY, p1.x, p1.y, p2.x, p2.y);
+          if (distToBeam < 5) continue;
+        }
+
+        if (distToBase < bandHeight + 8 && distToTop < bandHeight + 8 &&
+            (distToBase < 12 || distToTop < 12 ||
+             (distToBase < bandHeight + 4 && distToTop < bandHeight + 4))) {
+          return { beamId: beam.id, loadId: band.loadId };
+        }
       }
     }
     return null;
-  }, [mesh, worldToScreen]);
+  }, [mesh, worldToScreen, loadCases, activeLoadCase]);
 
   const applyNewDimension = useCallback((beamId: number, newLength: number) => {
     if (isNaN(newLength) || newLength <= 0) return;
@@ -733,16 +802,20 @@ export function MeshEditor() {
     beam: IBeamElement,
     n1: INode,
     n2: INode,
-    isSelected: boolean
-  ) => {
-    if (!beam.distributedLoad) return;
-    const { qx, qy } = beam.distributedLoad;
-    const qyE = beam.distributedLoad.qyEnd ?? qy;
-    if (qx === 0 && qy === 0 && qyE === 0) return;
+    isSelected: boolean,
+    loadData?: { qx: number; qy: number; qxEnd?: number; qyEnd?: number; startT?: number; endT?: number; coordSystem?: 'local' | 'global'; description?: string },
+    stackOffset?: number,
+    overrideColor?: string
+  ): number => {
+    const dlSource = loadData ?? beam.distributedLoad;
+    if (!dlSource) return 0;
+    const { qx, qy } = dlSource;
+    const qyE = dlSource.qyEnd ?? qy;
+    if (qx === 0 && qy === 0 && qyE === 0) return 0;
 
-    const coordSystem = beam.distributedLoad.coordSystem ?? 'local';
-    const startT = beam.distributedLoad.startT ?? 0;
-    const endT = beam.distributedLoad.endT ?? 1;
+    const coordSystem = dlSource.coordSystem ?? 'local';
+    const startT = dlSource.startT ?? 0;
+    const endT = dlSource.endT ?? 1;
     const isVariable = qyE !== qy;
 
     const p1 = worldToScreen(n1.x, n1.y);
@@ -754,14 +827,18 @@ export function MeshEditor() {
     const screenAngle = Math.atan2(p2.y - p1.y, p2.x - p1.x);
     const perpAngle = isGlobal ? Math.PI / 2 : screenAngle + Math.PI / 2;
 
-    // Compute start and end points on beam for partial loads
+    // Apply stacking offset: shift arrow bases perpendicular to the beam
+    // All loads stack in the SAME positive perpendicular direction from the beam
+    const sOffset = stackOffset ?? 0;
+
+    // Compute start and end points on beam for partial loads (with stacking offset)
     const loadP1 = {
-      x: p1.x + (p2.x - p1.x) * startT,
-      y: p1.y + (p2.y - p1.y) * startT
+      x: p1.x + (p2.x - p1.x) * startT + Math.cos(perpAngle) * sOffset,
+      y: p1.y + (p2.y - p1.y) * startT + Math.sin(perpAngle) * sOffset
     };
     const loadP2 = {
-      x: p1.x + (p2.x - p1.x) * endT,
-      y: p1.y + (p2.y - p1.y) * endT
+      x: p1.x + (p2.x - p1.x) * endT + Math.cos(perpAngle) * sOffset,
+      y: p1.y + (p2.y - p1.y) * endT + Math.sin(perpAngle) * sOffset
     };
 
     // Arrow lengths: for trapezoidal loads, interpolate between start and end
@@ -772,10 +849,10 @@ export function MeshEditor() {
 
     const numArrows = Math.max(2, Math.round(8 * (endT - startT)));
 
-    const loadColor = isSelected ? '#ef4444' : '#3b82f6';
-    ctx.strokeStyle = loadColor;
-    ctx.fillStyle = loadColor;
-    ctx.lineWidth = 2;
+    const loadColorVal = overrideColor ?? (isSelected ? '#ef4444' : '#3b82f6');
+    ctx.strokeStyle = loadColorVal;
+    ctx.fillStyle = loadColorVal;
+    ctx.lineWidth = isSelected ? 2.5 : 2;
 
     const topPoints: { x: number; y: number }[] = [];
 
@@ -784,14 +861,14 @@ export function MeshEditor() {
       const px = loadP1.x + (loadP2.x - loadP1.x) * t;
       const py = loadP1.y + (loadP2.y - loadP1.y) * t;
 
-      // Interpolate arrow length and sign for trapezoidal
+      // Interpolate arrow length for trapezoidal
       const currentQ = qy + (qyE - qy) * t;
       const currentLen = startLen + (endLen - startLen) * t;
-      const sign = currentQ >= 0 ? 1 : -1;
 
-      // Arrow start (top)
-      const topX = px + Math.cos(perpAngle) * currentLen * sign;
-      const topY = py + Math.sin(perpAngle) * currentLen * sign;
+      // Always extend arrow in the positive perpendicular direction (consistent stacking)
+      // The arrow shaft goes from base (on beam/stack) to top (away from beam)
+      const topX = px + Math.cos(perpAngle) * currentLen;
+      const topY = py + Math.sin(perpAngle) * currentLen;
       topPoints.push({ x: topX, y: topY });
 
       // Only draw arrow if load is non-zero at this point
@@ -801,14 +878,27 @@ export function MeshEditor() {
         ctx.lineTo(px, py);
         ctx.stroke();
 
-        // Arrow head
-        const arrowDir = Math.atan2(py - topY, px - topX);
-        ctx.beginPath();
-        ctx.moveTo(px, py);
-        ctx.lineTo(px - 8 * Math.cos(arrowDir - 0.4), py - 8 * Math.sin(arrowDir - 0.4));
-        ctx.lineTo(px - 8 * Math.cos(arrowDir + 0.4), py - 8 * Math.sin(arrowDir + 0.4));
-        ctx.closePath();
-        ctx.fill();
+        // Arrow head: for positive qy, arrowhead at base (pointing toward beam = compression)
+        // For negative qy, arrowhead at top (pointing away from beam = tension/uplift)
+        if (currentQ >= 0) {
+          // Arrowhead at base (px, py) — points toward beam
+          const arrowDir = Math.atan2(py - topY, px - topX);
+          ctx.beginPath();
+          ctx.moveTo(px, py);
+          ctx.lineTo(px - 8 * Math.cos(arrowDir - 0.4), py - 8 * Math.sin(arrowDir - 0.4));
+          ctx.lineTo(px - 8 * Math.cos(arrowDir + 0.4), py - 8 * Math.sin(arrowDir + 0.4));
+          ctx.closePath();
+          ctx.fill();
+        } else {
+          // Arrowhead at top (topX, topY) — points away from beam (tension)
+          const arrowDir = Math.atan2(topY - py, topX - px);
+          ctx.beginPath();
+          ctx.moveTo(topX, topY);
+          ctx.lineTo(topX - 8 * Math.cos(arrowDir - 0.4), topY - 8 * Math.sin(arrowDir - 0.4));
+          ctx.lineTo(topX - 8 * Math.cos(arrowDir + 0.4), topY - 8 * Math.sin(arrowDir + 0.4));
+          ctx.closePath();
+          ctx.fill();
+        }
       }
     }
 
@@ -822,10 +912,33 @@ export function MeshEditor() {
       ctx.stroke();
     }
 
+    // If selected, draw a subtle highlight outline around the load region
+    if (isSelected) {
+      ctx.save();
+      ctx.strokeStyle = '#ffffff';
+      ctx.lineWidth = 0.8;
+      ctx.globalAlpha = 0.4;
+      ctx.setLineDash([3, 3]);
+      ctx.beginPath();
+      // Draw outline: base line -> end top -> tops reversed -> start base
+      ctx.moveTo(loadP1.x, loadP1.y);
+      ctx.lineTo(loadP2.x, loadP2.y);
+      ctx.lineTo(topPoints[topPoints.length - 1].x, topPoints[topPoints.length - 1].y);
+      for (let i = topPoints.length - 2; i >= 0; i--) {
+        ctx.lineTo(topPoints[i].x, topPoints[i].y);
+      }
+      ctx.closePath();
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.globalAlpha = 1;
+      ctx.restore();
+    }
+
     const startTop = topPoints[0];
     const endTop = topPoints[topPoints.length - 1];
 
     // Load value label
+    ctx.fillStyle = loadColorVal;
     ctx.font = 'bold 11px sans-serif';
     const midX = (startTop.x + endTop.x) / 2;
     const midY = (startTop.y + endTop.y) / 2 - 10;
@@ -838,12 +951,20 @@ export function MeshEditor() {
       ctx.fillText(qText, midX - 30, midY);
     }
 
+    // Show description label from load data or load case (if available)
+    const dlDesc = loadData?.description ?? loadCases.find(lc => lc.id === activeLoadCase)?.distributedLoads.find(dl => dl.elementId === beam.id)?.description;
+    if (dlDesc) {
+      ctx.font = 'italic 10px sans-serif';
+      ctx.fillStyle = '#d4d4d8';
+      ctx.fillText(dlDesc, midX - 30, midY - 14);
+    }
+
     // Draw resize handles on selected beams with loads
     if (isSelected) {
       const handleSize = 6;
       const half = handleSize / 2;
       ctx.fillStyle = '#ffffff';
-      ctx.strokeStyle = loadColor;
+      ctx.strokeStyle = loadColorVal;
       ctx.lineWidth = 2;
 
       // Start handle
@@ -854,13 +975,95 @@ export function MeshEditor() {
       ctx.fillRect(endTop.x - half, endTop.y - half, handleSize, handleSize);
       ctx.strokeRect(endTop.x - half, endTop.y - half, handleSize, handleSize);
     }
-  }, [worldToScreen]);
+
+    // Draw Qx (axial load) as separate block with parallel arrows in different color
+    const qxE = dlSource.qxEnd ?? qx;
+    if (qx !== 0 || qxE !== 0) {
+      const qxColor = isSelected ? '#f97316' : '#f59e0b'; // orange tones
+      ctx.strokeStyle = qxColor;
+      ctx.fillStyle = qxColor;
+      ctx.lineWidth = 1.5;
+
+      const axialAngle = Math.atan2(p2.y - p1.y, p2.x - p1.x);
+      const axialPerp = axialAngle + Math.PI / 2;
+      // Offset the qx arrows below qy arrows
+      const qxOffset = 50;
+
+      const maxQx = Math.max(Math.abs(qx), Math.abs(qxE));
+      const qxBaseLen = Math.min(30, maxQx / 500 * 30 + 15);
+      const qxStartLen = maxQx === 0 ? 15 : (Math.abs(qx) / maxQx) * qxBaseLen;
+      const qxEndLen = maxQx === 0 ? 15 : (Math.abs(qxE) / maxQx) * qxBaseLen;
+
+      const numQxArrows = Math.max(2, Math.round(6 * (endT - startT)));
+      const qxTopPoints: { x: number; y: number }[] = [];
+
+      for (let i = 0; i <= numQxArrows; i++) {
+        const t = i / numQxArrows;
+        const baseX = loadP1.x + (loadP2.x - loadP1.x) * t;
+        const baseY = loadP1.y + (loadP2.y - loadP1.y) * t;
+        // Offset perpendicular to beam (below qy)
+        const px = baseX + Math.cos(axialPerp) * qxOffset;
+        const py = baseY + Math.sin(axialPerp) * qxOffset;
+
+        const currentQx = qx + (qxE - qx) * t;
+        const currentLen = qxStartLen + (qxEndLen - qxStartLen) * t;
+        const sign = currentQx >= 0 ? 1 : -1;
+
+        // Arrow tip along beam axis
+        const tipX = px + Math.cos(axialAngle) * currentLen * sign;
+        const tipY = py + Math.sin(axialAngle) * currentLen * sign;
+        qxTopPoints.push({ x: px, y: py });
+
+        if (Math.abs(currentQx) > 0.1) {
+          ctx.beginPath();
+          ctx.moveTo(px, py);
+          ctx.lineTo(tipX, tipY);
+          ctx.stroke();
+
+          // Arrow head
+          const arrowDir = Math.atan2(tipY - py, tipX - px);
+          ctx.beginPath();
+          ctx.moveTo(tipX, tipY);
+          ctx.lineTo(tipX - 6 * Math.cos(arrowDir - 0.4), tipY - 6 * Math.sin(arrowDir - 0.4));
+          ctx.lineTo(tipX - 6 * Math.cos(arrowDir + 0.4), tipY - 6 * Math.sin(arrowDir + 0.4));
+          ctx.closePath();
+          ctx.fill();
+        }
+      }
+
+      // Connect base points with a line
+      if (qxTopPoints.length >= 2) {
+        ctx.beginPath();
+        ctx.moveTo(qxTopPoints[0].x, qxTopPoints[0].y);
+        for (let i = 1; i < qxTopPoints.length; i++) {
+          ctx.lineTo(qxTopPoints[i].x, qxTopPoints[i].y);
+        }
+        ctx.stroke();
+      }
+
+      // Qx label
+      ctx.font = 'bold 10px sans-serif';
+      const qxMidX = (qxTopPoints[0].x + qxTopPoints[qxTopPoints.length - 1].x) / 2;
+      const qxMidY = (qxTopPoints[0].y + qxTopPoints[qxTopPoints.length - 1].y) / 2 + 14;
+      const isQxVariable = qxE !== qx;
+      if (isQxVariable) {
+        ctx.fillText(`qx = ${(Math.abs(qx) / 1000).toFixed(1)}..${(Math.abs(qxE) / 1000).toFixed(1)} kN/m`, qxMidX - 45, qxMidY);
+      } else {
+        ctx.fillText(`qx = ${(Math.abs(qx) / 1000).toFixed(1)} kN/m`, qxMidX - 30, qxMidY);
+      }
+    }
+
+    // Return the max arrow height for stacking purposes (always positive)
+    return Math.max(startLen, endLen);
+  }, [worldToScreen, loadCases, activeLoadCase]);
 
   const constraintTools = ['addPinned', 'addXRoller', 'addZRoller', 'addZSpring', 'addRotSpring', 'addXSpring', 'addFixed'] as const;
   const isConstraintTool = constraintTools.includes(selectedTool as typeof constraintTools[number]);
 
   const drawDimensions = useCallback((ctx: CanvasRenderingContext2D) => {
-    const dimColor = '#718096';
+    const _rs = getComputedStyle(document.documentElement);
+    const dimColor = _rs.getPropertyValue('--canvas-dim-color').trim() || '#718096';
+    const dimBg = _rs.getPropertyValue('--canvas-bg').trim() || '#1a1a2e';
     const dimOffset = 30; // px offset perpendicular to beam
 
     for (const beam of mesh.beamElements.values()) {
@@ -949,8 +1152,8 @@ export function MeshEditor() {
       const midX = (d1.x + d2.x) / 2;
       const midY = (d1.y + d2.y) / 2;
 
-      // White background for readability
-      ctx.fillStyle = '#1a1a2e';
+      // Background for readability
+      ctx.fillStyle = dimBg;
       ctx.fillRect(midX - textWidth / 2 - 3, midY - textHeight / 2 - 1, textWidth + 6, textHeight + 2);
       ctx.strokeStyle = dimColor;
       ctx.lineWidth = 0.5;
@@ -1069,6 +1272,9 @@ export function MeshEditor() {
   ) => {
     if (!result) return;
 
+    const _diagStyle = getComputedStyle(document.documentElement);
+    const _diagLabelBg = _diagStyle.getPropertyValue('--canvas-label-bg').trim() || 'rgba(26,26,46,0.85)';
+
     // Use global label list for collision detection across all beams and diagram types
     const allPlacedLabels = globalLabels || [];
 
@@ -1183,7 +1389,7 @@ export function MeshEditor() {
       ctx.lineTo(p2.x, p2.y);
       ctx.stroke();
 
-      // Draw perpendicular tick marks at beam ends for shear force diagram (sign indicators)
+      // Draw perpendicular tick marks and +/- sign indicators for shear force diagram
       if (diagramType === 'shear') {
         const tickLen = 5; // half-length of tick mark
         // Tick at start (p1)
@@ -1198,10 +1404,35 @@ export function MeshEditor() {
         ctx.moveTo(p2.x - Math.cos(perpAngle) * tickLen, p2.y - Math.sin(perpAngle) * tickLen);
         ctx.lineTo(p2.x + Math.cos(perpAngle) * tickLen, p2.y + Math.sin(perpAngle) * tickLen);
         ctx.stroke();
+
+        // Draw +/- sign symbols on the diagram to indicate sign convention
+        // Place symbols at ~25% and ~75% along the beam where absolute value is significant
+        ctx.font = 'bold 11px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillStyle = color;
+        const signPositions = [0.25, 0.75];
+        for (const sp of signPositions) {
+          const stationIdx = Math.min(Math.floor(sp * (forces.stations.length - 1)), forces.stations.length - 2);
+          const localT = sp * (forces.stations.length - 1) - stationIdx;
+          const val = values[stationIdx] + (values[stationIdx + 1] - values[stationIdx]) * localT;
+          if (Math.abs(val) > maxVal * 0.05) {
+            const baseX = p1.x + (p2.x - p1.x) * sp;
+            const baseY = p1.y + (p2.y - p1.y) * sp;
+            const offset = val * scale;
+            // Place the sign symbol at mid-height of the diagram fill
+            const signX = baseX + Math.cos(perpAngle) * offset * 0.5;
+            const signY = baseY + Math.sin(perpAngle) * offset * 0.5;
+            const sign = val > 0 ? '+' : '\u2212';
+            ctx.fillText(sign, signX, signY);
+          }
+        }
+        ctx.textAlign = 'start';
+        ctx.textBaseline = 'alphabetic';
       }
 
       // Draw baseline
-      ctx.strokeStyle = '#666';
+      ctx.strokeStyle = _diagStyle.getPropertyValue('--canvas-baseline').trim() || '#666';
       ctx.lineWidth = 1;
       ctx.setLineDash([4, 4]);
       ctx.beginPath();
@@ -1300,13 +1531,118 @@ export function MeshEditor() {
         const offset = (diagramType === 'moment' ? -diagramValue : diagramValue) * scale;
 
         const label = diagramType === 'moment' ? formatMoment(values[maxIdx]) : formatForce(values[maxIdx]);
-        // Position label on the diagram curve side, offset by a few pixels past the curve
+        // Position label on the diagram curve side
         const labelOffsetX = labelX + Math.cos(perpAngle) * offset - 22;
-        const labelOffsetY = labelY + Math.sin(perpAngle) * offset + (diagramType === 'moment' ? 14 : -8);
-        tryPlaceLabel(label, labelOffsetX, labelOffsetY, '#fff');
+        // For moment: place at bottom of the curve (past the curve in diagram direction)
+        // For other diagrams: place slightly above the curve
+        const labelOffsetY = labelY + Math.sin(perpAngle) * offset + (diagramType === 'moment' ? 16 : -8);
+        tryPlaceLabel(label, labelOffsetX, labelOffsetY, _diagLabelBg);
       }
     }
   }, [result, mesh, worldToScreen, diagramScale]);
+
+  /** Draw envelope force diagram (min/max curves) for a given diagram type. */
+  const drawEnvelopeDiagram = useCallback((
+    ctx: CanvasRenderingContext2D,
+    diagramType: 'normal' | 'shear' | 'moment'
+  ) => {
+    if (!envelopeResult) return;
+
+    for (const beam of mesh.beamElements.values()) {
+      const envForces = envelopeResult.beamForces.get(beam.id);
+      if (!envForces) continue;
+
+      const nodes = mesh.getBeamElementNodes(beam);
+      if (!nodes) continue;
+      const [n1, n2] = nodes;
+
+      const p1 = worldToScreen(n1.x, n1.y);
+      const p2 = worldToScreen(n2.x, n2.y);
+
+      const L = calculateBeamLength(n1, n2);
+      const screenAngle = Math.atan2(p2.y - p1.y, p2.x - p1.x);
+      const perpAngle = screenAngle - Math.PI / 2;
+
+      let minValues: number[];
+      let maxValues: number[];
+      let maxAbsVal: number;
+      let color: string;
+      let fillColorMin: string;
+      let fillColorMax: string;
+
+      switch (diagramType) {
+        case 'normal':
+          minValues = envForces.minN;
+          maxValues = envForces.maxN;
+          maxAbsVal = Math.max(...envForces.maxN.map(Math.abs), ...envForces.minN.map(Math.abs), 1);
+          color = '#22c55e';
+          fillColorMin = 'rgba(34, 197, 94, 0.15)';
+          fillColorMax = 'rgba(34, 197, 94, 0.3)';
+          break;
+        case 'shear':
+          minValues = envForces.minV;
+          maxValues = envForces.maxV;
+          maxAbsVal = Math.max(...envForces.maxV.map(Math.abs), ...envForces.minV.map(Math.abs), 1);
+          color = '#3b82f6';
+          fillColorMin = 'rgba(59, 130, 246, 0.15)';
+          fillColorMax = 'rgba(59, 130, 246, 0.3)';
+          break;
+        case 'moment':
+        default:
+          minValues = envForces.minM;
+          maxValues = envForces.maxM;
+          maxAbsVal = Math.max(...envForces.maxM.map(Math.abs), ...envForces.minM.map(Math.abs), 1);
+          color = '#ef4444';
+          fillColorMin = 'rgba(239, 68, 68, 0.15)';
+          fillColorMax = 'rgba(239, 68, 68, 0.3)';
+          break;
+      }
+
+      const scale = diagramScale / maxAbsVal;
+
+      // Helper: draw one envelope curve
+      const drawCurve = (values: number[], fillColor: string, dashed: boolean) => {
+        ctx.fillStyle = fillColor;
+        ctx.strokeStyle = color;
+        ctx.lineWidth = dashed ? 1.5 : 2;
+        if (dashed) ctx.setLineDash([6, 4]);
+        else ctx.setLineDash([]);
+
+        ctx.beginPath();
+        ctx.moveTo(p1.x, p1.y);
+
+        const pts: { x: number; y: number }[] = [];
+        for (let i = 0; i < envForces.stations.length; i++) {
+          const t = envForces.stations[i] / L;
+          const baseX = p1.x + (p2.x - p1.x) * t;
+          const baseY = p1.y + (p2.y - p1.y) * t;
+          const diagramValue = values[i];
+          const offset = (diagramType === 'moment' ? -diagramValue : diagramValue) * scale;
+          const px = baseX + Math.cos(perpAngle) * offset;
+          const py = baseY + Math.sin(perpAngle) * offset;
+          pts.push({ x: px, y: py });
+          ctx.lineTo(px, py);
+        }
+
+        ctx.lineTo(p2.x, p2.y);
+        ctx.closePath();
+        ctx.fill();
+
+        // Outline
+        ctx.beginPath();
+        ctx.moveTo(p1.x, p1.y);
+        for (const pt of pts) ctx.lineTo(pt.x, pt.y);
+        ctx.lineTo(p2.x, p2.y);
+        ctx.stroke();
+        ctx.setLineDash([]);
+      };
+
+      // Draw max envelope (solid)
+      drawCurve(maxValues, fillColorMax, false);
+      // Draw min envelope (dashed)
+      drawCurve(minValues, fillColorMin, true);
+    }
+  }, [envelopeResult, mesh, worldToScreen, diagramScale]);
 
   const draw = useCallback(() => {
     const canvas = canvasRef.current;
@@ -1325,11 +1661,17 @@ export function MeshEditor() {
     const width = canvas.width;
     const height = canvas.height;
 
-    ctx.fillStyle = '#1a1a2e';
+    // Read theme-aware colors from CSS variables
+    const rootStyle = getComputedStyle(document.documentElement);
+    const canvasBg = rootStyle.getPropertyValue('--canvas-bg').trim() || '#1a1a2e';
+    const canvasGrid = rootStyle.getPropertyValue('--canvas-grid').trim() || '#2a2a4a';
+    const canvasAxis = rootStyle.getPropertyValue('--canvas-axis').trim() || '#4a4a6a';
+
+    ctx.fillStyle = canvasBg;
     ctx.fillRect(0, 0, width, height);
 
     // Draw grid
-    ctx.strokeStyle = '#2a2a4a';
+    ctx.strokeStyle = canvasGrid;
     ctx.lineWidth = 1;
 
     const topLeft = screenToWorld(0, 0);
@@ -1357,7 +1699,7 @@ export function MeshEditor() {
     }
 
     // Draw axes
-    ctx.strokeStyle = '#4a4a6a';
+    ctx.strokeStyle = canvasAxis;
     ctx.lineWidth = 2;
     const origin = worldToScreen(0, 0);
 
@@ -1664,10 +2006,10 @@ export function MeshEditor() {
     const nodeIdToIndex = result ? getNodeIdToIndex() : null;
     const dofsPerNode = analysisType === 'frame' ? 3 : analysisType === 'plate_bending' ? 3 : 2;
 
-    // Draw triangle elements (for plane stress/strain)
+    // Draw elements (triangles and quads) for plane stress/strain
     for (const element of mesh.elements.values()) {
       const nodes = mesh.getElementNodes(element);
-      if (nodes.length !== 3) continue;
+      if (nodes.length < 3) continue;
 
       let drawNodes = nodes;
 
@@ -1686,14 +2028,14 @@ export function MeshEditor() {
         });
       }
 
-      const p1 = worldToScreen(drawNodes[0].x, drawNodes[0].y);
-      const p2 = worldToScreen(drawNodes[1].x, drawNodes[1].y);
-      const p3 = worldToScreen(drawNodes[2].x, drawNodes[2].y);
+      // Build polygon path for any element (3 or 4 nodes)
+      const screenPts = drawNodes.map(n => worldToScreen(n.x, n.y));
 
       ctx.beginPath();
-      ctx.moveTo(p1.x, p1.y);
-      ctx.lineTo(p2.x, p2.y);
-      ctx.lineTo(p3.x, p3.y);
+      ctx.moveTo(screenPts[0].x, screenPts[0].y);
+      for (let pi = 1; pi < screenPts.length; pi++) {
+        ctx.lineTo(screenPts[pi].x, screenPts[pi].y);
+      }
       ctx.closePath();
 
       // Fill with stress color or material color
@@ -1701,16 +2043,69 @@ export function MeshEditor() {
         const stress = result.elementStresses.get(element.id);
         if (stress) {
           let value: number;
-          let minVal = result.minVonMises;
-          let maxVal = result.maxVonMises;
+          let minVal: number;
+          let maxVal: number;
+          const sr = result.stressRanges;
           switch (stressType) {
-            case 'sigmaX': value = stress.sigmaX; break;
-            case 'sigmaY': value = stress.sigmaY; break;
-            case 'tauXY': value = stress.tauXY; break;
-            case 'mx': value = stress.mx ?? 0; minVal = result.minMoment ?? 0; maxVal = result.maxMoment ?? 1; break;
-            case 'my': value = stress.my ?? 0; minVal = result.minMoment ?? 0; maxVal = result.maxMoment ?? 1; break;
-            case 'mxy': value = stress.mxy ?? 0; minVal = result.minMoment ?? 0; maxVal = result.maxMoment ?? 1; break;
-            default: value = stress.vonMises;
+            case 'sigmaX':
+              value = stress.sigmaX;
+              minVal = sr?.sigmaX.min ?? result.minVonMises;
+              maxVal = sr?.sigmaX.max ?? result.maxVonMises;
+              break;
+            case 'sigmaY':
+              value = stress.sigmaY;
+              minVal = sr?.sigmaY.min ?? result.minVonMises;
+              maxVal = sr?.sigmaY.max ?? result.maxVonMises;
+              break;
+            case 'tauXY':
+              value = stress.tauXY;
+              minVal = sr?.tauXY.min ?? result.minVonMises;
+              maxVal = sr?.tauXY.max ?? result.maxVonMises;
+              break;
+            case 'mx':
+              value = stress.mx ?? 0;
+              minVal = sr?.mx.min ?? result.minMoment ?? 0;
+              maxVal = sr?.mx.max ?? result.maxMoment ?? 1;
+              break;
+            case 'my':
+              value = stress.my ?? 0;
+              minVal = sr?.my.min ?? result.minMoment ?? 0;
+              maxVal = sr?.my.max ?? result.maxMoment ?? 1;
+              break;
+            case 'mxy':
+              value = stress.mxy ?? 0;
+              minVal = sr?.mxy.min ?? result.minMoment ?? 0;
+              maxVal = sr?.mxy.max ?? result.maxMoment ?? 1;
+              break;
+            case 'vx':
+              value = stress.vx ?? 0;
+              minVal = sr?.vx.min ?? 0;
+              maxVal = sr?.vx.max ?? 1;
+              break;
+            case 'vy':
+              value = stress.vy ?? 0;
+              minVal = sr?.vy.min ?? 0;
+              maxVal = sr?.vy.max ?? 1;
+              break;
+            case 'nx':
+              value = stress.nx ?? 0;
+              minVal = sr?.nx.min ?? 0;
+              maxVal = sr?.nx.max ?? 1;
+              break;
+            case 'ny':
+              value = stress.ny ?? 0;
+              minVal = sr?.ny.min ?? 0;
+              maxVal = sr?.ny.max ?? 1;
+              break;
+            case 'nxy':
+              value = stress.nxy ?? 0;
+              minVal = sr?.nxy.min ?? 0;
+              maxVal = sr?.nxy.max ?? 1;
+              break;
+            default:
+              value = stress.vonMises;
+              minVal = result.minVonMises;
+              maxVal = result.maxVonMises;
           }
           ctx.fillStyle = getStressColor(value, minVal, maxVal);
         }
@@ -1737,93 +2132,155 @@ export function MeshEditor() {
     // Draw plate region boundaries
     for (const plate of mesh.plateRegions.values()) {
       const isPlateSelected = selection.plateIds.has(plate.id);
-      const bl = worldToScreen(plate.x, plate.y);
-      const br = worldToScreen(plate.x + plate.width, plate.y);
-      const tr = worldToScreen(plate.x + plate.width, plate.y + plate.height);
-      const tl = worldToScreen(plate.x, plate.y + plate.height);
 
-      // Light background fill
-      ctx.fillStyle = isPlateSelected ? 'rgba(233, 69, 96, 0.08)' : 'rgba(59, 130, 246, 0.05)';
-      ctx.beginPath();
-      ctx.moveTo(bl.x, bl.y);
-      ctx.lineTo(br.x, br.y);
-      ctx.lineTo(tr.x, tr.y);
-      ctx.lineTo(tl.x, tl.y);
-      ctx.closePath();
-      ctx.fill();
+      if (plate.isPolygon && plate.polygon && plate.polygon.length >= 3) {
+        // Draw actual polygon outline
+        const polyScreenPts = plate.polygon.map(p => worldToScreen(p.x, p.y));
 
-      // Dashed boundary rectangle
-      ctx.strokeStyle = isPlateSelected ? '#e94560' : '#3b82f680';
-      ctx.lineWidth = isPlateSelected ? 2 : 1.5;
-      ctx.setLineDash([6, 4]);
-      ctx.beginPath();
-      ctx.moveTo(bl.x, bl.y);
-      ctx.lineTo(br.x, br.y);
-      ctx.lineTo(tr.x, tr.y);
-      ctx.lineTo(tl.x, tl.y);
-      ctx.closePath();
-      ctx.stroke();
-      ctx.setLineDash([]);
+        // Fill
+        ctx.fillStyle = isPlateSelected ? 'rgba(233, 69, 96, 0.08)' : 'rgba(59, 130, 246, 0.05)';
+        ctx.beginPath();
+        polyScreenPts.forEach((p, i) => i === 0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y));
+        ctx.closePath();
+        ctx.fill();
 
-      // Draw edge load arrows for this plate
+        // Stroke
+        ctx.strokeStyle = isPlateSelected ? '#e94560' : '#3b82f680';
+        ctx.lineWidth = isPlateSelected ? 2 : 1.5;
+        ctx.setLineDash([6, 4]);
+        ctx.beginPath();
+        polyScreenPts.forEach((p, i) => i === 0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y));
+        ctx.closePath();
+        ctx.stroke();
+        ctx.setLineDash([]);
+
+        // Draw voids
+        if (plate.voids) {
+          for (const voidPoly of plate.voids) {
+            const voidScreenPts = voidPoly.map(p => worldToScreen(p.x, p.y));
+            ctx.strokeStyle = isPlateSelected ? '#e94560' : '#3b82f680';
+            ctx.lineWidth = isPlateSelected ? 2 : 1.5;
+            ctx.setLineDash([4, 3]);
+            ctx.beginPath();
+            voidScreenPts.forEach((p, i) => i === 0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y));
+            ctx.closePath();
+            ctx.stroke();
+            ctx.setLineDash([]);
+          }
+        }
+      } else {
+        // Rectangular plate: draw bounding box
+        const bl = worldToScreen(plate.x, plate.y);
+        const br = worldToScreen(plate.x + plate.width, plate.y);
+        const tr = worldToScreen(plate.x + plate.width, plate.y + plate.height);
+        const tl = worldToScreen(plate.x, plate.y + plate.height);
+
+        // Light background fill
+        ctx.fillStyle = isPlateSelected ? 'rgba(233, 69, 96, 0.08)' : 'rgba(59, 130, 246, 0.05)';
+        ctx.beginPath();
+        ctx.moveTo(bl.x, bl.y);
+        ctx.lineTo(br.x, br.y);
+        ctx.lineTo(tr.x, tr.y);
+        ctx.lineTo(tl.x, tl.y);
+        ctx.closePath();
+        ctx.fill();
+
+        // Dashed boundary rectangle
+        ctx.strokeStyle = isPlateSelected ? '#e94560' : '#3b82f680';
+        ctx.lineWidth = isPlateSelected ? 2 : 1.5;
+        ctx.setLineDash([6, 4]);
+        ctx.beginPath();
+        ctx.moveTo(bl.x, bl.y);
+        ctx.lineTo(br.x, br.y);
+        ctx.lineTo(tr.x, tr.y);
+        ctx.lineTo(tl.x, tl.y);
+        ctx.closePath();
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
+
+      // Draw edge load as distributed q-load visualization
       if (showLoads && viewMode !== 'geometry') {
         const activeLc = loadCases.find(lc => lc.id === activeLoadCase);
         if (activeLc && activeLc.edgeLoads) {
           for (const el of activeLc.edgeLoads) {
             if (el.plateId !== plate.id) continue;
-            const edgeNodes = plate.edges[el.edge].nodeIds;
-            if (edgeNodes.length < 2) continue;
+
+            // Collect edge screen positions: polygon edge index or named edge
+            const edgeScreenPts: { x: number; y: number }[] = [];
+            if (typeof el.edge === 'number' && plate.isPolygon && plate.polygon) {
+              // Polygon edge: use the two polygon vertices as endpoints
+              const n = plate.polygon.length;
+              const v1 = plate.polygon[el.edge % n];
+              const v2 = plate.polygon[(el.edge + 1) % n];
+              edgeScreenPts.push(worldToScreen(v1.x, v1.y));
+              edgeScreenPts.push(worldToScreen(v2.x, v2.y));
+            } else if (typeof el.edge === 'string') {
+              const edgeNodes = plate.edges[el.edge].nodeIds;
+              if (edgeNodes.length < 2) continue;
+              for (const nodeId of edgeNodes) {
+                const node = mesh.getNode(nodeId);
+                if (!node) continue;
+                edgeScreenPts.push(worldToScreen(node.x, node.y));
+              }
+            }
+            if (edgeScreenPts.length < 2) continue;
 
             const mag = Math.sqrt(el.px ** 2 + el.py ** 2);
             if (mag < 0.01) continue;
 
-            // Draw arrows along the edge
-            const arrowLen = Math.min(30, mag / 500 * 30 + 15);
-            ctx.strokeStyle = '#3b82f6';
-            ctx.fillStyle = '#3b82f6';
-            ctx.lineWidth = 2;
+            const arrowLen = Math.min(35, mag / 500 * 30 + 18);
+            const edgeColor = '#3b82f6';
+            ctx.strokeStyle = edgeColor;
+            ctx.fillStyle = edgeColor;
+            ctx.lineWidth = 1.5;
 
-            for (const nodeId of edgeNodes) {
-              const node = mesh.getNode(nodeId);
-              if (!node) continue;
-              const sp = worldToScreen(node.x, node.y);
+            // Normalized load direction in screen coords
+            const ndx = el.px / mag;
+            const ndy = -(el.py / mag); // flip Y
 
-              // Arrow direction: normalized (px, py) in screen coords
-              const dx = el.px / mag * arrowLen;
-              const dy = -(el.py / mag) * arrowLen; // flip Y for screen
+            // Draw connecting line at arrow tails (offset from edge)
+            ctx.beginPath();
+            ctx.moveTo(edgeScreenPts[0].x - ndx * arrowLen, edgeScreenPts[0].y - ndy * arrowLen);
+            for (let i = 1; i < edgeScreenPts.length; i++) {
+              ctx.lineTo(edgeScreenPts[i].x - ndx * arrowLen, edgeScreenPts[i].y - ndy * arrowLen);
+            }
+            ctx.stroke();
 
-              const startX = sp.x - dx;
-              const startY = sp.y - dy;
+            // Draw arrows from tail line to edge nodes
+            const arrowAngle = Math.atan2(ndy, ndx);
+            for (const sp of edgeScreenPts) {
+              const tailX = sp.x - ndx * arrowLen;
+              const tailY = sp.y - ndy * arrowLen;
 
+              // Arrow shaft
               ctx.beginPath();
-              ctx.moveTo(startX, startY);
+              ctx.moveTo(tailX, tailY);
               ctx.lineTo(sp.x, sp.y);
               ctx.stroke();
 
               // Arrow head
-              const angle = Math.atan2(dy, dx);
               ctx.beginPath();
               ctx.moveTo(sp.x, sp.y);
-              ctx.lineTo(sp.x - 8 * Math.cos(angle - 0.4), sp.y - 8 * Math.sin(angle - 0.4));
-              ctx.lineTo(sp.x - 8 * Math.cos(angle + 0.4), sp.y - 8 * Math.sin(angle + 0.4));
+              ctx.lineTo(sp.x - 7 * Math.cos(arrowAngle - 0.4), sp.y - 7 * Math.sin(arrowAngle - 0.4));
+              ctx.lineTo(sp.x - 7 * Math.cos(arrowAngle + 0.4), sp.y - 7 * Math.sin(arrowAngle + 0.4));
               ctx.closePath();
               ctx.fill();
             }
 
-            // Label
-            const firstNode = mesh.getNode(edgeNodes[0]);
-            const lastNode = mesh.getNode(edgeNodes[edgeNodes.length - 1]);
-            if (firstNode && lastNode) {
-              const sp1 = worldToScreen(firstNode.x, firstNode.y);
-              const sp2 = worldToScreen(lastNode.x, lastNode.y);
-              const midX = (sp1.x + sp2.x) / 2;
-              const midY = (sp1.y + sp2.y) / 2;
-              ctx.font = 'bold 10px sans-serif';
-              ctx.fillStyle = '#3b82f6';
-              const pxKN = (el.px / 1000).toFixed(1);
-              const pyKN = (el.py / 1000).toFixed(1);
-              ctx.fillText(`p = (${pxKN}, ${pyKN}) kN/m`, midX + 5, midY - arrowLen - 5);
-            }
+            // Label at midpoint of edge, offset along arrow direction
+            const midIdx = Math.floor(edgeScreenPts.length / 2);
+            const labelX = edgeScreenPts[midIdx].x - ndx * (arrowLen + 8);
+            const labelY = edgeScreenPts[midIdx].y - ndy * (arrowLen + 8);
+            ctx.font = 'bold 10px sans-serif';
+            ctx.fillStyle = edgeColor;
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            const pxKN = (el.px / 1000).toFixed(1);
+            const pzKN = (el.py / 1000).toFixed(1);
+            ctx.fillText(`p = (${pxKN}, ${pzKN}) kN/m`, labelX, labelY);
+            ctx.textAlign = 'start';
+            ctx.textBaseline = 'alphabetic';
           }
         }
       }
@@ -1843,8 +2300,14 @@ export function MeshEditor() {
         for (const [pId, dT] of plateDeltas) {
           const plate = mesh.getPlateRegion(pId);
           if (!plate) continue;
-          const cx = plate.x + plate.width / 2;
-          const cy = plate.y + plate.height / 2;
+          let cx: number, cy: number;
+          if (plate.isPolygon && plate.polygon) {
+            const c = polygonCentroid(plate.polygon);
+            cx = c.x; cy = c.y;
+          } else {
+            cx = plate.x + plate.width / 2;
+            cy = plate.y + plate.height / 2;
+          }
           const sp = worldToScreen(cx, cy);
           ctx.font = 'bold 11px sans-serif';
           ctx.fillStyle = '#f59e0b';
@@ -1930,6 +2393,51 @@ export function MeshEditor() {
       const isSelected = selection.elementIds.has(beam.id);
       const isHovered = hoveredBeamId === beam.id;
 
+      // Draw profile width outline when showProfileNames is enabled and section.h is available
+      if (showProfileNames && beam.section && beam.section.h && showMembers) {
+        const hPixels = beam.section.h * viewState.scale; // section height in pixels
+        const dx = p2.x - p1.x;
+        const dy = p2.y - p1.y;
+        const len = Math.sqrt(dx * dx + dy * dy);
+        if (len > 0) {
+          // Perpendicular direction (unit vector)
+          const perpX = -dy / len;
+          const perpY = dx / len;
+          const halfH = hPixels / 2;
+
+          // Four corners of the profile rectangle
+          const c1x = p1.x + perpX * halfH;
+          const c1y = p1.y + perpY * halfH;
+          const c2x = p2.x + perpX * halfH;
+          const c2y = p2.y + perpY * halfH;
+          const c3x = p2.x - perpX * halfH;
+          const c3y = p2.y - perpY * halfH;
+          const c4x = p1.x - perpX * halfH;
+          const c4y = p1.y - perpY * halfH;
+
+          const beamColor = isSelected ? '#e94560' : isHovered ? '#fbbf24' : '#60a5fa';
+
+          // Semi-transparent fill
+          ctx.save();
+          ctx.globalAlpha = 0.12;
+          ctx.fillStyle = beamColor;
+          ctx.beginPath();
+          ctx.moveTo(c1x, c1y);
+          ctx.lineTo(c2x, c2y);
+          ctx.lineTo(c3x, c3y);
+          ctx.lineTo(c4x, c4y);
+          ctx.closePath();
+          ctx.fill();
+
+          // Thin outline
+          ctx.globalAlpha = 0.3;
+          ctx.strokeStyle = beamColor;
+          ctx.lineWidth = 1;
+          ctx.stroke();
+          ctx.restore();
+        }
+      }
+
       if (showMembers) {
         ctx.strokeStyle = isSelected ? '#e94560' : isHovered ? '#fbbf24' : '#60a5fa';
         ctx.lineWidth = isSelected ? 6 : isHovered ? 5 : 4;
@@ -1965,10 +2473,33 @@ export function MeshEditor() {
         ctx.stroke();
       }
 
-      // Draw distributed load if present (only in loads/results view)
+      // Draw distributed loads if present (only in loads/results view)
+      // Iterate over all individual loads from the active load case for this beam
+      // Stacking: offset subsequent loads by the arrow height of previous loads
+      // Each load can be individually selected via selectedDistLoadIds
       if (showLoads && viewMode !== 'geometry') {
-        const isLoadSelected = isSelected || selection.distLoadBeamIds.has(beam.id);
-        drawDistributedLoad(ctx, beam, n1, n2, isLoadSelected);
+        const beamLevelSelected = isSelected || selection.distLoadBeamIds.has(beam.id);
+        const activeLc = loadCases.find(lc => lc.id === activeLoadCase);
+        const beamLoads = activeLc?.distributedLoads.filter(dl => dl.elementId === beam.id) ?? [];
+        if (beamLoads.length > 0) {
+          let cumulativeOffset = 0;
+          for (const dl of beamLoads) {
+            // Check if this specific load is individually selected
+            const isThisLoadSelected = beamLevelSelected || (dl.id != null && selection.selectedDistLoadIds.has(dl.id));
+            // Use a brighter/highlighted color when individually selected
+            const loadColor = isThisLoadSelected ? '#ef4444' : (activeLc?.color ?? '#3b82f6');
+            const arrowHeight = drawDistributedLoad(ctx, beam, n1, n2, isThisLoadSelected, {
+              qx: dl.qx, qy: dl.qy, qxEnd: dl.qxEnd, qyEnd: dl.qyEnd,
+              startT: dl.startT, endT: dl.endT, coordSystem: dl.coordSystem,
+              description: dl.description
+            }, cumulativeOffset, loadColor);
+            // Stack next load after this one's arrows (always positive direction)
+            cumulativeOffset += arrowHeight + 4; // 4px gap between stacked loads
+          }
+        } else {
+          // Fallback: draw from beam.distributedLoad (e.g. during live preview)
+          drawDistributedLoad(ctx, beam, n1, n2, beamLevelSelected);
+        }
       }
 
       // Draw profile name on beam (only if a named profile is assigned)
@@ -2018,7 +2549,7 @@ export function MeshEditor() {
 
       // Draw hinge symbols (small circles) at released beam ends
       if (beam.endReleases) {
-        ctx.fillStyle = '#1a1a2e';
+        ctx.fillStyle = canvasBg;
         ctx.strokeStyle = '#f59e0b';
         ctx.lineWidth = 2;
         if (beam.endReleases.startMoment) {
@@ -2122,9 +2653,239 @@ export function MeshEditor() {
     if (viewMode === 'results' && result) {
       // Shared label collision list across all diagram types
       const diagramLabels: { x: number; y: number; w: number; h: number }[] = [];
-      if (showNormal) drawForceDiagram(ctx, 'normal', diagramLabels);
-      if (showShear) drawForceDiagram(ctx, 'shear', diagramLabels);
-      if (showMoment) drawForceDiagram(ctx, 'moment', diagramLabels);
+      if (showEnvelope && envelopeResult) {
+        // Draw envelope diagrams (min/max across all combinations)
+        if (showNormal) drawEnvelopeDiagram(ctx, 'normal');
+        if (showShear) drawEnvelopeDiagram(ctx, 'shear');
+        if (showMoment) drawEnvelopeDiagram(ctx, 'moment');
+      } else {
+        if (showNormal) drawForceDiagram(ctx, 'normal', diagramLabels);
+        if (showShear) drawForceDiagram(ctx, 'shear', diagramLabels);
+        if (showMoment) drawForceDiagram(ctx, 'moment', diagramLabels);
+      }
+
+      // Sign convention legend (top-left corner)
+      if (showMoment || showShear || showNormal) {
+        const legX = 10;
+        const legY = 10;
+        const entries: { label: string; color: string; sign: string }[] = [];
+        if (showMoment) entries.push({ label: 'M', color: '#ef4444', sign: '+ on tension side' });
+        if (showShear) entries.push({ label: 'V', color: '#3b82f6', sign: '+ upward (left)' });
+        if (showNormal) entries.push({ label: 'N', color: '#22c55e', sign: '+ tension' });
+        const lineH = 16;
+        const panelW = 160;
+        const panelH = entries.length * lineH + 10;
+        ctx.fillStyle = 'rgba(20, 20, 40, 0.8)';
+        ctx.beginPath();
+        if (typeof ctx.roundRect === 'function') {
+          ctx.roundRect(legX, legY, panelW, panelH, 5);
+        } else {
+          ctx.rect(legX, legY, panelW, panelH);
+        }
+        ctx.fill();
+        ctx.strokeStyle = 'rgba(255, 255, 255, 0.15)';
+        ctx.lineWidth = 1;
+        ctx.stroke();
+        ctx.font = '10px sans-serif';
+        ctx.textAlign = 'left';
+        ctx.textBaseline = 'middle';
+        for (let i = 0; i < entries.length; i++) {
+          const e = entries[i];
+          const yPos = legY + 5 + i * lineH + lineH / 2;
+          ctx.fillStyle = e.color;
+          ctx.fillRect(legX + 6, yPos - 4, 8, 8);
+          ctx.fillStyle = '#e2e8f0';
+          ctx.fillText(`${e.label}: ${e.sign}`, legX + 20, yPos);
+        }
+        ctx.textAlign = 'start';
+        ctx.textBaseline = 'alphabetic';
+      }
+
+      // Draw deflection diagrams when enabled
+      if (showDeflections && analysisType === 'frame' && nodeIdToIndex) {
+        const deflColor = '#8b5cf6'; // purple
+        const deflFill = 'rgba(139, 92, 246, 0.25)';
+
+        for (const beam of mesh.beamElements.values()) {
+          const nodes = mesh.getBeamElementNodes(beam);
+          if (!nodes) continue;
+          const [n1, n2] = nodes;
+
+          const idx1 = nodeIdToIndex.get(n1.id);
+          const idx2 = nodeIdToIndex.get(n2.id);
+          if (idx1 === undefined || idx2 === undefined) continue;
+
+          const L = calculateBeamLength(n1, n2);
+          if (L < 1e-6) continue;
+          const alpha = calculateBeamAngle(n1, n2);
+          const cosA = Math.cos(alpha);
+          const sinA = Math.sin(alpha);
+
+          // Get nodal displacements (in metres)
+          const u1g = result.displacements[idx1 * 3];
+          const v1g = result.displacements[idx1 * 3 + 1];
+          const theta1 = result.displacements[idx1 * 3 + 2];
+          const u2g = result.displacements[idx2 * 3];
+          const v2g = result.displacements[idx2 * 3 + 1];
+          const theta2 = result.displacements[idx2 * 3 + 2];
+
+          // Transform to local beam coords
+          const v1_loc = -u1g * sinA + v1g * cosA;
+          const v2_loc = -u2g * sinA + v2g * cosA;
+
+          // Chord line deflection (linear interpolation between end displacements)
+          // Relative deflection = actual - chord
+          const p1s = worldToScreen(n1.x, n1.y);
+          const p2s = worldToScreen(n2.x, n2.y);
+          const screenAngle = Math.atan2(p2s.y - p1s.y, p2s.x - p1s.x);
+          const perpAngle = screenAngle - Math.PI / 2;
+
+          // Compute deflection curve using Hermite interpolation
+          const numPts = 20;
+          const deflValues: number[] = [];
+          const curvePoints: { x: number; y: number }[] = [];
+
+          for (let i = 0; i <= numPts; i++) {
+            const t = i / numPts;
+            // Hermite shape functions for transverse displacement
+            const H1 = 1 - 3 * t * t + 2 * t * t * t;
+            const H2 = t - 2 * t * t + t * t * t;
+            const H3 = 3 * t * t - 2 * t * t * t;
+            const H4 = -t * t + t * t * t;
+
+            const v_loc = H1 * v1_loc + H2 * theta1 * L + H3 * v2_loc + H4 * theta2 * L;
+
+            // Chord line displacement (linear interpolation)
+            const v_chord = v1_loc + (v2_loc - v1_loc) * t;
+
+            // Relative deflection from chord (in metres)
+            const defl = v_loc - v_chord;
+            deflValues.push(defl);
+
+            // Base position along beam in screen space
+            const baseX = p1s.x + (p2s.x - p1s.x) * t;
+            const baseY = p1s.y + (p2s.y - p1s.y) * t;
+
+            // Scale deflection for diagram visibility (use diagramScale)
+            const maxDefl = Math.max(...deflValues.map(Math.abs), 1e-10);
+            const scaledOffset = defl * diagramScale / (maxDefl > 1e-10 ? maxDefl : 1) * 30;
+
+            curvePoints.push({
+              x: baseX + Math.cos(perpAngle) * scaledOffset,
+              y: baseY + Math.sin(perpAngle) * scaledOffset
+            });
+          }
+
+          // Re-scale all points now that we know the max deflection
+          const maxDefl = Math.max(...deflValues.map(Math.abs), 1e-10);
+          const scaleFactor = maxDefl > 1e-10 ? diagramScale / maxDefl * 30 : 0;
+
+          const finalPoints: { x: number; y: number }[] = [];
+          for (let i = 0; i <= numPts; i++) {
+            const t = i / numPts;
+            const baseX = p1s.x + (p2s.x - p1s.x) * t;
+            const baseY = p1s.y + (p2s.y - p1s.y) * t;
+            const scaledOffset = deflValues[i] * scaleFactor;
+
+            finalPoints.push({
+              x: baseX + Math.cos(perpAngle) * scaledOffset,
+              y: baseY + Math.sin(perpAngle) * scaledOffset
+            });
+          }
+
+          // Draw filled deflection diagram
+          ctx.fillStyle = deflFill;
+          ctx.beginPath();
+          ctx.moveTo(p1s.x, p1s.y);
+          for (const pt of finalPoints) {
+            ctx.lineTo(pt.x, pt.y);
+          }
+          ctx.lineTo(p2s.x, p2s.y);
+          ctx.closePath();
+          ctx.fill();
+
+          // Draw outline
+          ctx.strokeStyle = deflColor;
+          ctx.lineWidth = 2;
+          ctx.beginPath();
+          ctx.moveTo(p1s.x, p1s.y);
+          for (const pt of finalPoints) {
+            ctx.lineTo(pt.x, pt.y);
+          }
+          ctx.lineTo(p2s.x, p2s.y);
+          ctx.stroke();
+
+          // Draw reference line (chord) along beam axis
+          ctx.strokeStyle = '#666';
+          ctx.lineWidth = 1;
+          ctx.setLineDash([4, 4]);
+          ctx.beginPath();
+          ctx.moveTo(p1s.x, p1s.y);
+          ctx.lineTo(p2s.x, p2s.y);
+          ctx.stroke();
+          ctx.setLineDash([]);
+
+          // Find max deflection and label it
+          let maxDeflIdx = 0;
+          let absMaxDefl = 0;
+          for (let i = 0; i < deflValues.length; i++) {
+            if (Math.abs(deflValues[i]) > absMaxDefl) {
+              absMaxDefl = Math.abs(deflValues[i]);
+              maxDeflIdx = i;
+            }
+          }
+
+          if (absMaxDefl > 1e-10) {
+            const deflMM = deflValues[maxDeflIdx] * 1000; // convert m to mm
+            const label = `\u03B4 = ${Math.abs(deflMM).toFixed(2)} mm`;
+            const labelPt = finalPoints[maxDeflIdx];
+
+            ctx.font = 'bold 11px sans-serif';
+            ctx.fillStyle = deflColor;
+            const textW = ctx.measureText(label).width + 6;
+            const textH = 14;
+
+            // Background for readability
+            ctx.fillStyle = 'rgba(20, 20, 40, 0.85)';
+            ctx.fillRect(labelPt.x - textW / 2, labelPt.y - textH - 4, textW, textH);
+            ctx.fillStyle = deflColor;
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'bottom';
+            ctx.fillText(label, labelPt.x, labelPt.y - 4);
+            ctx.textAlign = 'start';
+            ctx.textBaseline = 'alphabetic';
+          }
+        }
+
+        // Add deflection to legend if it was drawn
+        const legX = 10;
+        const existingLegendH = (showMoment || showShear || showNormal) ?
+          ((showMoment ? 1 : 0) + (showShear ? 1 : 0) + (showNormal ? 1 : 0)) * 16 + 10 + 10 : 10;
+        const legY = existingLegendH;
+        const lineH = 16;
+        const panelW2 = 160;
+        const panelH2 = lineH + 10;
+        ctx.fillStyle = 'rgba(20, 20, 40, 0.8)';
+        ctx.beginPath();
+        if (typeof ctx.roundRect === 'function') {
+          ctx.roundRect(legX, legY, panelW2, panelH2, 5);
+        } else {
+          ctx.rect(legX, legY, panelW2, panelH2);
+        }
+        ctx.fill();
+        ctx.strokeStyle = 'rgba(255, 255, 255, 0.15)';
+        ctx.lineWidth = 1;
+        ctx.stroke();
+        ctx.font = '10px sans-serif';
+        ctx.textAlign = 'left';
+        ctx.textBaseline = 'middle';
+        ctx.fillStyle = deflColor;
+        ctx.fillRect(legX + 6, legY + 5 + lineH / 2 - 4, 8, 8);
+        ctx.fillStyle = '#e2e8f0';
+        ctx.fillText('\u03B4: deflection from chord', legX + 20, legY + 5 + lineH / 2);
+        ctx.textAlign = 'start';
+        ctx.textBaseline = 'alphabetic';
+      }
     }
 
     // Draw pending element preview
@@ -2182,8 +2943,8 @@ export function MeshEditor() {
       ctx.setLineDash([]);
     }
 
-    // Draw plate rubber-band preview
-    if (selectedTool === 'addPlate' && plateFirstCorner && cursorPos) {
+    // Draw plate rubber-band preview (rectangle mode)
+    if (selectedTool === 'addPlate' && plateDrawMode === 'rectangle' && plateFirstCorner && cursorPos) {
       const cursorWorld = screenToWorld(cursorPos.x, cursorPos.y);
       const snappedCursor = snapToGridFn(cursorWorld.x, cursorWorld.y);
       const p1 = worldToScreen(plateFirstCorner.x, plateFirstCorner.y);
@@ -2214,6 +2975,133 @@ export function MeshEditor() {
       const midX = (p1.x + p3.x) / 2;
       const midY = (p1.y + p3.y) / 2;
       ctx.fillText(`${(w * 1000).toFixed(0)} x ${(h * 1000).toFixed(0)} mm`, midX + 5, midY - 5);
+    }
+
+    // Draw plate polygon preview (polygon mode)
+    if (selectedTool === 'addPlate' && plateDrawMode === 'polygon' && platePolygonPoints.length > 0) {
+      const isOutlineClosed = plateEditState !== 'outline';
+      const outlinePts = platePolygonPoints.map(p => worldToScreen(p.x, p.y));
+
+      // Fill the outline
+      ctx.fillStyle = 'rgba(59, 130, 246, 0.1)';
+      ctx.beginPath();
+      outlinePts.forEach((p, i) => i === 0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y));
+      if (isOutlineClosed) ctx.closePath();
+      ctx.fill();
+
+      // Draw outline edges
+      ctx.strokeStyle = '#3b82f6';
+      ctx.lineWidth = 2;
+      ctx.setLineDash(isOutlineClosed ? [6, 4] : []);
+      ctx.beginPath();
+      outlinePts.forEach((p, i) => i === 0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y));
+      if (isOutlineClosed) ctx.closePath();
+
+      // If still drawing outline, add rubber-band line to cursor
+      if (plateEditState === 'outline' && cursorPos) {
+        const cursorWorld = screenToWorld(cursorPos.x, cursorPos.y);
+        const snappedCursor = snapToGridFn(cursorWorld.x, cursorWorld.y);
+        const cursorScreen = worldToScreen(snappedCursor.x, snappedCursor.y);
+        ctx.lineTo(cursorScreen.x, cursorScreen.y);
+      }
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      // Draw outline vertex dots
+      ctx.fillStyle = '#3b82f6';
+      for (const p of outlinePts) {
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, 5, 0, Math.PI * 2);
+        ctx.fill();
+      }
+
+      // Highlight first vertex (close target) when drawing outline
+      if (plateEditState === 'outline' && outlinePts.length >= 3) {
+        ctx.strokeStyle = '#fbbf24';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.arc(outlinePts[0].x, outlinePts[0].y, 10, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+
+      // Draw completed voids
+      for (const voidPoly of plateVoids) {
+        const voidPts = voidPoly.map(p => worldToScreen(p.x, p.y));
+        ctx.fillStyle = 'rgba(233, 69, 96, 0.15)';
+        ctx.strokeStyle = '#e94560';
+        ctx.lineWidth = 2;
+        ctx.setLineDash([4, 3]);
+        ctx.beginPath();
+        voidPts.forEach((p, i) => i === 0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y));
+        ctx.closePath();
+        ctx.fill();
+        ctx.stroke();
+        ctx.setLineDash([]);
+
+        // Void vertex dots
+        ctx.fillStyle = '#e94560';
+        for (const p of voidPts) {
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, 4, 0, Math.PI * 2);
+          ctx.fill();
+        }
+      }
+
+      // Draw current void being drawn
+      if (plateEditState === 'void' && currentVoidPoints.length > 0) {
+        const voidPts = currentVoidPoints.map(p => worldToScreen(p.x, p.y));
+        ctx.strokeStyle = '#e94560';
+        ctx.lineWidth = 2;
+        ctx.setLineDash([]);
+        ctx.beginPath();
+        voidPts.forEach((p, i) => i === 0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y));
+
+        // Rubber-band line to cursor
+        if (cursorPos) {
+          const cursorWorld = screenToWorld(cursorPos.x, cursorPos.y);
+          const snappedCursor = snapToGridFn(cursorWorld.x, cursorWorld.y);
+          const cursorScreen = worldToScreen(snappedCursor.x, snappedCursor.y);
+          ctx.lineTo(cursorScreen.x, cursorScreen.y);
+        }
+        ctx.stroke();
+
+        // Void vertex dots
+        ctx.fillStyle = '#e94560';
+        for (const p of voidPts) {
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, 4, 0, Math.PI * 2);
+          ctx.fill();
+        }
+
+        // Highlight first vertex (close target) when drawing void
+        if (voidPts.length >= 3) {
+          ctx.strokeStyle = '#fbbf24';
+          ctx.lineWidth = 2;
+          ctx.beginPath();
+          ctx.arc(voidPts[0].x, voidPts[0].y, 10, 0, Math.PI * 2);
+          ctx.stroke();
+        }
+      }
+
+      // Show bounding box dimensions
+      if (isOutlineClosed) {
+        const xs = platePolygonPoints.map(p => p.x);
+        const ys = platePolygonPoints.map(p => p.y);
+        const minXP = Math.min(...xs);
+        const maxXP = Math.max(...xs);
+        const minYP = Math.min(...ys);
+        const maxYP = Math.max(...ys);
+        const bboxW = maxXP - minXP;
+        const bboxH = maxYP - minYP;
+        const centerP = worldToScreen((minXP + maxXP) / 2, (minYP + maxYP) / 2);
+        ctx.font = 'bold 11px sans-serif';
+        ctx.fillStyle = '#3b82f6';
+        ctx.fillText(
+          `Polygon: ${platePolygonPoints.length} pts, bbox ${(bboxW * 1000).toFixed(0)} x ${(bboxH * 1000).toFixed(0)} mm` +
+          (plateVoids.length > 0 ? `, ${plateVoids.length} void(s)` : ''),
+          centerP.x + 5, centerP.y - 10
+        );
+      }
     }
 
     // Draw nodes
@@ -2267,7 +3155,8 @@ export function MeshEditor() {
       if (showNodes) {
         // Check if this is a plate mesh node (belongs to a plate region)
         const isPlateNode = Array.from(mesh.plateRegions.values()).some(pr => pr.nodeIds.includes(node.id) && !pr.cornerNodeIds.includes(node.id));
-        const nodeRadius = isPlateNode ? 3 : 6;
+        const isSubNodeFlag = mesh.isSubNode(node.id);
+        const nodeRadius = isPlateNode ? 3 : isSubNodeFlag ? 4 : 6;
         ctx.beginPath();
         ctx.arc(screen.x, screen.y, nodeRadius, 0, Math.PI * 2);
 
@@ -2275,6 +3164,8 @@ export function MeshEditor() {
           ctx.fillStyle = '#fbbf24';
         } else if (isSelected) {
           ctx.fillStyle = '#e94560';
+        } else if (isSubNodeFlag) {
+          ctx.fillStyle = '#f59e0b'; // orange for sub-nodes
         } else if (isPlateNode) {
           ctx.fillStyle = '#8b949e'; // gray for plate mesh nodes
         } else {
@@ -2283,7 +3174,7 @@ export function MeshEditor() {
         ctx.fill();
 
         ctx.strokeStyle = '#fff';
-        ctx.lineWidth = 2;
+        ctx.lineWidth = isSubNodeFlag ? 1.5 : 2;
         ctx.stroke();
       }
 
@@ -2292,6 +3183,26 @@ export function MeshEditor() {
         ctx.fillStyle = '#fff';
         ctx.font = 'bold 11px sans-serif';
         ctx.fillText(`${node.id}`, screen.x + 10, screen.y - 10);
+      }
+
+      // Displacement values at node (results view only)
+      if (showDisplacements && viewMode === 'results' && result && nodeIdToIndex) {
+        const idx = nodeIdToIndex.get(node.id);
+        if (idx !== undefined) {
+          const ux = result.displacements[idx * dofsPerNode];
+          const uz = result.displacements[idx * dofsPerNode + 1];
+          if (ux !== undefined && uz !== undefined && (Math.abs(ux) > 1e-10 || Math.abs(uz) > 1e-10)) {
+            const uxMM = ux * 1000; // convert m to mm
+            const uzMM = uz * 1000;
+            ctx.font = '9px monospace';
+            ctx.fillStyle = '#a78bfa'; // purple tint
+            ctx.textAlign = 'left';
+            ctx.textBaseline = 'top';
+            const label = `ux=${uxMM.toFixed(2)} uz=${uzMM.toFixed(2)}`;
+            ctx.fillText(label, screen.x + 10, screen.y + 6);
+            ctx.textBaseline = 'alphabetic';
+          }
+        }
       }
     }
 
@@ -2370,6 +3281,20 @@ export function MeshEditor() {
       }
     }
 
+    // Draw sub-node preview at cursor when addSubNode tool active
+    if (selectedTool === 'addSubNode' && cursorPos && hoveredBeamId !== null) {
+      ctx.save();
+      ctx.globalAlpha = 0.7;
+      ctx.beginPath();
+      ctx.arc(cursorPos.x, cursorPos.y, 5, 0, Math.PI * 2);
+      ctx.fillStyle = '#f59e0b';
+      ctx.fill();
+      ctx.strokeStyle = '#fff';
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+      ctx.restore();
+    }
+
     // Draw point load preview at cursor when addLoad tool active
     if ((selectedTool === 'addLoad' || selectedTool === 'addLineLoad') && cursorPos) {
       ctx.strokeStyle = selectedTool === 'addLoad' ? '#ef4444' : '#3b82f6';
@@ -2417,7 +3342,24 @@ export function MeshEditor() {
 
     // Draw reaction forces if result exists (only in results view)
     if (viewMode === 'results' && result && analysisType === 'frame' && showReactions) {
-      ctx.font = 'bold 10px sans-serif';
+      const reactionFont = 'bold 11px sans-serif';
+      ctx.font = reactionFont;
+
+      // Helper: draw a label with background box for readability
+      const drawReactionLabel = (text: string, cx: number, cy: number, color: string) => {
+        ctx.font = reactionFont;
+        const tw = ctx.measureText(text).width;
+        const pad = 3;
+        ctx.fillStyle = 'rgba(26, 26, 46, 0.85)';
+        ctx.fillRect(cx - tw / 2 - pad, cy - 10, tw + pad * 2, 14);
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 1;
+        ctx.strokeRect(cx - tw / 2 - pad, cy - 10, tw + pad * 2, 14);
+        ctx.fillStyle = color;
+        ctx.textAlign = 'center';
+        ctx.fillText(text, cx, cy);
+        ctx.textAlign = 'start';
+      };
 
       for (const node of mesh.nodes.values()) {
         if (!node.constraints.x && !node.constraints.y && !node.constraints.rotation) continue;
@@ -2435,7 +3377,7 @@ export function MeshEditor() {
         const reactionColor = '#10b981';
         const arrowLen = 40;
         const supportOffset = 30; // offset below support symbol
-        let labelY = screen.y + supportOffset + arrowLen + 8;
+        let labelY = screen.y + supportOffset + arrowLen + 14;
 
         // Draw Rx arrow (horizontal, positioned below support symbol)
         if (Math.abs(Rx) > 0.01) {
@@ -2443,7 +3385,6 @@ export function MeshEditor() {
           ctx.strokeStyle = reactionColor;
           ctx.fillStyle = reactionColor;
           ctx.lineWidth = 2;
-          // Position arrow below the support symbol
           const rxY = screen.y + supportOffset + 10;
           const startX = screen.x - dir * arrowLen;
           const tipX = screen.x;
@@ -2451,17 +3392,14 @@ export function MeshEditor() {
           ctx.moveTo(startX, rxY);
           ctx.lineTo(tipX, rxY);
           ctx.stroke();
-          // Arrow head pointing toward node
           ctx.beginPath();
           ctx.moveTo(tipX, rxY);
           ctx.lineTo(tipX - dir * 8, rxY - 4);
           ctx.lineTo(tipX - dir * 8, rxY + 4);
           ctx.closePath();
           ctx.fill();
-          // Label below arrow
-          ctx.fillStyle = reactionColor;
-          ctx.fillText(`Rx: ${fmtForce(Rx)}`, screen.x - 30, labelY);
-          labelY += 12;
+          drawReactionLabel(`Rx = ${fmtForce(Rx)}`, screen.x, labelY, reactionColor);
+          labelY += 18;
         }
 
         // Draw Ry arrow (vertical, starting below support)
@@ -2470,7 +3408,6 @@ export function MeshEditor() {
           ctx.fillStyle = reactionColor;
           ctx.lineWidth = 2;
           if (Ry > 0) {
-            // Positive (upward): arrow below support pointing up
             const startY = screen.y + supportOffset + arrowLen;
             const tipY = screen.y + supportOffset;
             ctx.beginPath();
@@ -2484,7 +3421,6 @@ export function MeshEditor() {
             ctx.closePath();
             ctx.fill();
           } else {
-            // Negative (downward): arrow below support pointing down
             const startY = screen.y + supportOffset;
             const tipY = screen.y + supportOffset + arrowLen;
             ctx.beginPath();
@@ -2498,15 +3434,13 @@ export function MeshEditor() {
             ctx.closePath();
             ctx.fill();
           }
-          // Label
-          ctx.fillStyle = reactionColor;
-          ctx.fillText(`Rz: ${fmtForce(Ry)}`, screen.x - 30, labelY);
-          labelY += 12;
+          drawReactionLabel(`Rz = ${fmtForce(Ry)}`, screen.x, labelY, reactionColor);
+          labelY += 18;
         }
 
-        // Draw Rm arc arrow (moment)
+        // Draw Rm arc arrow (moment) with arc symbol
         if (Math.abs(Rm) > 0.01) {
-          const arcR = 16;
+          const arcR = 18;
           ctx.strokeStyle = reactionColor;
           ctx.lineWidth = 2;
           const startAngle = Rm > 0 ? -Math.PI * 0.75 : Math.PI * 0.25;
@@ -2526,8 +3460,8 @@ export function MeshEditor() {
           ctx.lineTo(tipX - 6 * Math.cos(tangent + 0.5), tipY - 6 * Math.sin(tangent + 0.5));
           ctx.closePath();
           ctx.fill();
-          // Label
-          ctx.fillText(`Rm: ${fmtMoment(Rm)}`, screen.x - 25, labelY);
+          // Moment label positioned above the node
+          drawReactionLabel(`M = ${fmtMoment(Rm)}`, screen.x, screen.y - arcR - 8, reactionColor);
         }
       }
     }
@@ -2754,6 +3688,83 @@ export function MeshEditor() {
       }
     }
 
+    // Draw color scale legend for stress contours
+    if (showStress && result && result.elementStresses.size > 0) {
+      const sr = result.stressRanges;
+      let legendMin: number;
+      let legendMax: number;
+      switch (stressType) {
+        case 'sigmaX': legendMin = sr?.sigmaX.min ?? result.minVonMises; legendMax = sr?.sigmaX.max ?? result.maxVonMises; break;
+        case 'sigmaY': legendMin = sr?.sigmaY.min ?? result.minVonMises; legendMax = sr?.sigmaY.max ?? result.maxVonMises; break;
+        case 'tauXY': legendMin = sr?.tauXY.min ?? result.minVonMises; legendMax = sr?.tauXY.max ?? result.maxVonMises; break;
+        case 'mx': legendMin = sr?.mx.min ?? result.minMoment ?? 0; legendMax = sr?.mx.max ?? result.maxMoment ?? 1; break;
+        case 'my': legendMin = sr?.my.min ?? result.minMoment ?? 0; legendMax = sr?.my.max ?? result.maxMoment ?? 1; break;
+        case 'mxy': legendMin = sr?.mxy.min ?? result.minMoment ?? 0; legendMax = sr?.mxy.max ?? result.maxMoment ?? 1; break;
+        case 'vx': legendMin = sr?.vx.min ?? 0; legendMax = sr?.vx.max ?? 1; break;
+        case 'vy': legendMin = sr?.vy.min ?? 0; legendMax = sr?.vy.max ?? 1; break;
+        case 'nx': legendMin = sr?.nx.min ?? 0; legendMax = sr?.nx.max ?? 1; break;
+        case 'ny': legendMin = sr?.ny.min ?? 0; legendMax = sr?.ny.max ?? 1; break;
+        case 'nxy': legendMin = sr?.nxy.min ?? 0; legendMax = sr?.nxy.max ?? 1; break;
+        default: legendMin = result.minVonMises; legendMax = result.maxVonMises;
+      }
+      const stressLabels: Record<string, string> = {
+        vonMises: 'Von Mises', sigmaX: '\u03C3x', sigmaY: '\u03C3y', tauXY: '\u03C4xy',
+        mx: 'mx', my: 'my', mxy: 'mxy', vx: 'vx', vy: 'vy',
+        nx: 'Nx', ny: 'Ny', nxy: 'Nxy',
+      };
+      const legendWidth = 30;
+      const legendHeight = 200;
+      const legendRight = 20;
+      const legendBottom = 30;
+      const legendX = canvas.width - legendRight - legendWidth;
+      const legendY = canvas.height - legendBottom - legendHeight;
+      const numSteps = 10;
+      const stepHeight = legendHeight / numSteps;
+      const colorScale = generateColorScale(legendMin, legendMax, numSteps);
+      ctx.fillStyle = 'rgba(20, 20, 40, 0.85)';
+      const panelPad = 8;
+      const panelW = legendWidth + 90 + panelPad * 2;
+      const panelH = legendHeight + 30 + panelPad * 2;
+      const panelX = legendX - panelPad;
+      const panelY = legendY - 25 - panelPad;
+      ctx.beginPath();
+      if (typeof ctx.roundRect === 'function') {
+        ctx.roundRect(panelX, panelY, panelW, panelH, 6);
+      } else {
+        ctx.rect(panelX, panelY, panelW, panelH);
+      }
+      ctx.fill();
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.15)';
+      ctx.lineWidth = 1;
+      ctx.stroke();
+      ctx.fillStyle = '#e2e8f0';
+      ctx.font = 'bold 11px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'bottom';
+      ctx.fillText(stressLabels[stressType] || stressType, legendX + legendWidth / 2 + 30, legendY - 6);
+      for (let i = 0; i < numSteps; i++) {
+        const colorIdx = numSteps - i;
+        ctx.fillStyle = colorScale[colorIdx].color;
+        ctx.fillRect(legendX, legendY + i * stepHeight, legendWidth, stepHeight + 1);
+      }
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.3)';
+      ctx.lineWidth = 1;
+      ctx.strokeRect(legendX, legendY, legendWidth, legendHeight);
+      ctx.fillStyle = '#cbd5e1';
+      ctx.font = '10px sans-serif';
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'middle';
+      const lblX = legendX + legendWidth + 5;
+      const lblPositions = [0, 0.25, 0.5, 0.75, 1.0];
+      for (const t of lblPositions) {
+        const yPos = legendY + t * legendHeight;
+        const val = legendMax - t * (legendMax - legendMin);
+        ctx.fillText(formatResultValue(val, stressType), lblX, yPos);
+      }
+      ctx.textAlign = 'start';
+      ctx.textBaseline = 'alphabetic';
+    }
+
     // Draw selection box (window vs crossing)
     if (selectionBox) {
       const { startX, startY, endX, endY } = selectionBox;
@@ -2788,12 +3799,14 @@ export function MeshEditor() {
   }, [
     mesh, result, selection, viewState, showDeformed, deformationScale,
     showStress, stressType, pendingNodes, selectedTool, gridSize, analysisType,
-    showMoment, showShear, showNormal, diagramScale, viewMode, showProfileNames, showReactions, meshVersion,
-    showNodes, showMembers, showSupports, showLoads, showNodeLabels, showMemberLabels, showDimensions, forceUnit,
+    showMoment, showShear, showNormal, showDeflections, diagramScale, viewMode, showProfileNames, showReactions, meshVersion,
+    showNodes, showMembers, showSupports, showLoads, showNodeLabels, showMemberLabels, showDimensions, showDisplacements, forceUnit,
     isConstraintTool, cursorPos, snapNodeId, hoveredBeamId, hoveredNodeId, moveMode, selectionBox, draggedBeamId, draggedNode,
     structuralGrid, plateFirstCorner, loadCases, activeLoadCase,
+    plateDrawMode, platePolygonPoints, plateVoids, plateEditState, currentVoidPoints,
     screenToWorld, worldToScreen, snapToGridFn, getNodeIdToIndex, drawSupportSymbol, drawLoadArrow,
-    drawDistributedLoad, drawForceDiagram, drawGizmo, drawDimensions, drawConstraintPreview
+    drawDistributedLoad, drawForceDiagram, drawEnvelopeDiagram, drawGizmo, drawDimensions, drawConstraintPreview,
+    showEnvelope, envelopeResult
   ]);
 
   useEffect(() => {
@@ -2804,22 +3817,74 @@ export function MeshEditor() {
     const resize = () => {
       canvas.width = container.clientWidth;
       canvas.height = container.clientHeight;
+      dispatch({ type: 'SET_CANVAS_SIZE', payload: { width: canvas.width, height: canvas.height } });
       draw();
     };
 
     resize();
     window.addEventListener('resize', resize);
     return () => window.removeEventListener('resize', resize);
-  }, [draw]);
+  }, [draw, dispatch]);
 
   useEffect(() => {
     draw();
   }, [draw]);
 
+  // Auto-recalculate when geometry changes (meshVersion increments on REFRESH_MESH)
+  const autoSolveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Use refs to avoid stale closures in the debounced timer
+  const stateRef = useRef(state);
+  stateRef.current = state;
+  const meshRef = useRef(mesh);
+  meshRef.current = mesh;
+  // Ref for live solve throttling during node drag (Feature #17)
+  const lastLiveSolveRef = useRef(0);
+  useEffect(() => {
+    if (!autoRecalculate || meshVersion === 0) return;
+    // Only auto-solve when we have at least one beam or element and at least one constrained node
+    const hasStructure = mesh.beamElements.size > 0 || mesh.elements.size > 0;
+    const hasConstraints = Array.from(mesh.nodes.values()).some(n => n.constraints.x || n.constraints.y);
+    if (!hasStructure || !hasConstraints) return;
+
+    // Debounce: wait 300ms after last change before solving
+    if (autoSolveTimerRef.current) clearTimeout(autoSolveTimerRef.current);
+    autoSolveTimerRef.current = setTimeout(async () => {
+      try {
+        const { solve } = await import('../../core/solver/SolverService');
+        const { applyLoadCaseToMesh } = await import('../../context/FEMContext');
+        const currentState = stateRef.current;
+        const currentMesh = meshRef.current;
+        const activeLc = currentState.loadCases.find(lc => lc.id === currentState.activeLoadCase);
+        if (activeLc) applyLoadCaseToMesh(currentMesh, activeLc);
+        const result = await solve(currentMesh, {
+          analysisType: currentState.analysisType,
+          geometricNonlinear: false
+        });
+        dispatch({ type: 'SET_RESULT', payload: result });
+      } catch {
+        // Silently ignore auto-solve failures
+      }
+    }, 300);
+
+    return () => { if (autoSolveTimerRef.current) clearTimeout(autoSolveTimerRef.current); };
+  }, [meshVersion, autoRecalculate, dispatch]);
+
   // Clear last used beam section when switching away from addBeam tool
   useEffect(() => {
     if (selectedTool !== 'addBeam') {
       setLastUsedSection(null);
+    }
+  }, [selectedTool]);
+
+  // Clear polygon plate state when switching away from addPlate tool
+  useEffect(() => {
+    if (selectedTool !== 'addPlate') {
+      setPlatePolygonPoints([]);
+      setPlateVoids([]);
+      setCurrentVoidPoints([]);
+      setPlateEditState(null);
+      setPendingPolygonPlate(null);
+      setPlateFirstCorner(null);
     }
   }, [selectedTool]);
 
@@ -2840,6 +3905,51 @@ export function MeshEditor() {
         return;
       }
 
+      // Copy: Ctrl+C
+      if ((e.ctrlKey || e.metaKey) && e.key === 'c') {
+        if (selection.nodeIds.size > 0 || selection.elementIds.size > 0) {
+          e.preventDefault();
+          dispatch({ type: 'COPY_SELECTED' });
+          return;
+        }
+      }
+
+      // Paste: Ctrl+V
+      if ((e.ctrlKey || e.metaKey) && e.key === 'v') {
+        e.preventDefault();
+        dispatch({ type: 'PASTE', payload: { offsetX: 1, offsetY: 1 } });
+        return;
+      }
+
+      // Handle 'F' key - zoom to fit
+      if (e.key.toLowerCase() === 'f' && !e.ctrlKey && !e.altKey && !e.metaKey) {
+        const nodes = Array.from(mesh.nodes.values());
+        if (nodes.length > 0) {
+          let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+          for (const node of nodes) {
+            if (node.x < minX) minX = node.x;
+            if (node.x > maxX) maxX = node.x;
+            if (node.y < minY) minY = node.y;
+            if (node.y > maxY) maxY = node.y;
+          }
+          if (maxX - minX < 0.001) { minX -= 1; maxX += 1; }
+          if (maxY - minY < 0.001) { minY -= 1; maxY += 1; }
+          const { width: cw, height: ch } = state.canvasSize;
+          const padding = 0.1;
+          const availW = cw * (1 - 2 * padding);
+          const availH = ch * (1 - 2 * padding);
+          const scaleX = availW / (maxX - minX);
+          const scaleY = availH / (maxY - minY);
+          const newScale = Math.min(scaleX, scaleY);
+          const centerX = (minX + maxX) / 2;
+          const centerY = (minY + maxY) / 2;
+          const offsetX = cw / 2 - centerX * newScale;
+          const offsetY = ch / 2 + centerY * newScale;
+          dispatch({ type: 'SET_VIEW_STATE', payload: { scale: newScale, offsetX, offsetY } });
+        }
+        return;
+      }
+
       // Handle 'M' key - immediately activate move mode
       if (e.key.toLowerCase() === 'm' && !e.ctrlKey && !e.altKey && !e.metaKey) {
         if (selection.nodeIds.size > 0) {
@@ -2857,11 +3967,66 @@ export function MeshEditor() {
         }
       }
 
+      // Toggle polygon mode when addPlate tool is active and P is pressed
+      if (e.key.toLowerCase() === 'p' && selectedTool === 'addPlate' && !e.ctrlKey && !e.altKey && !e.metaKey) {
+        if (plateDrawMode === 'rectangle') {
+          setPlateDrawMode('polygon');
+          setPlateEditState('outline');
+          setPlateFirstCorner(null); // cancel any rectangle in progress
+        } else {
+          setPlateDrawMode('rectangle');
+          setPlateEditState(null);
+          setPlatePolygonPoints([]);
+          setPlateVoids([]);
+          setCurrentVoidPoints([]);
+        }
+        return;
+      }
+
+      // Enter key closes polygon outline or void in polygon plate mode
+      if (e.key === 'Enter' && selectedTool === 'addPlate' && plateDrawMode === 'polygon') {
+        if (plateEditState === 'outline' && platePolygonPoints.length >= 3) {
+          // Close the outline polygon - show toolbar for Add Void / Finish / Cancel
+          setPlateEditState(null);
+          return;
+        }
+        if (plateEditState === 'void' && currentVoidPoints.length >= 3) {
+          // Close the current void polygon
+          setPlateVoids(prev => [...prev, [...currentVoidPoints]]);
+          setCurrentVoidPoints([]);
+          setPlateEditState(null);
+          return;
+        }
+      }
+
       // Handle Escape - cancel current tool / move mode
       if (e.key === 'Escape') {
         if (beamLengthInput !== null) {
           setBeamLengthInput(null);
           return;
+        }
+        // Cancel polygon plate drawing states
+        if (selectedTool === 'addPlate' && plateDrawMode === 'polygon') {
+          if (plateEditState === 'void' && currentVoidPoints.length > 0) {
+            // Cancel current void, go back to toolbar
+            setCurrentVoidPoints([]);
+            setPlateEditState(null);
+            return;
+          }
+          if (plateEditState === 'outline' && platePolygonPoints.length > 0) {
+            // Cancel polygon outline
+            setPlatePolygonPoints([]);
+            setPlateEditState(null);
+            return;
+          }
+          if (platePolygonPoints.length > 0) {
+            // Cancel the whole polygon plate
+            setPlatePolygonPoints([]);
+            setPlateVoids([]);
+            setCurrentVoidPoints([]);
+            setPlateEditState(null);
+            return;
+          }
         }
         if (plateFirstCorner) {
           setPlateFirstCorner(null);
@@ -2894,7 +4059,10 @@ export function MeshEditor() {
           for (const elementId of selection.elementIds) {
             mesh.removeElement(elementId);
           }
+          // Clean up any orphan nodes left after element deletion
+          mesh.removeOrphanNodes();
           dispatch({ type: 'CLEAR_SELECTION' });
+          dispatch({ type: 'SET_RESULT', payload: null });
           dispatch({ type: 'REFRESH_MESH' });
         }
       }
@@ -2902,7 +4070,8 @@ export function MeshEditor() {
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [selection, pendingCommand, mesh, dispatch, selectedTool, pushUndo, pendingNodes, beamLengthInput]);
+  }, [selection, pendingCommand, mesh, dispatch, selectedTool, pushUndo, pendingNodes, beamLengthInput,
+      plateDrawMode, plateEditState, platePolygonPoints, plateVoids, currentVoidPoints]);
 
   // LC filtering: apply active load case to mesh when LC tab changes
   useEffect(() => {
@@ -2960,6 +4129,9 @@ export function MeshEditor() {
       setDragStart({ x: e.clientX, y: e.clientY });
       return;
     }
+
+    // Right-click is handled by onContextMenu, not here
+    if (e.button === 2) return;
 
     // Check grid line label click (circles) for dragging
     if (structuralGrid.showGridLines) {
@@ -3266,11 +4438,13 @@ export function MeshEditor() {
         } else {
           // Exclusive selection, prepare for dragging
           dispatch({ type: 'SET_SELECTION', payload: { nodeIds: new Set([node.id]), elementIds: new Set(), pointLoadNodeIds: new Set(), distLoadBeamIds: new Set() } });
-          // Don't allow dragging plate mesh nodes (only corner nodes)
-          const isPlateInteriorNode = Array.from(mesh.plateRegions.values()).some(
-            pr => pr.nodeIds.includes(node.id) && !pr.cornerNodeIds.includes(node.id)
+          // Don't allow dragging plate interior mesh nodes (only corner/vertex nodes)
+          const plateCornerInfo = findPlateCornerForNode(mesh, node.id);
+          const isPlateNode = Array.from(mesh.plateRegions.values()).some(
+            pr => pr.nodeIds.includes(node.id)
           );
-          if (!isPlateInteriorNode) {
+          const canDrag = !isPlateNode || plateCornerInfo !== null;
+          if (canDrag) {
             setDraggedNode(node.id);
             setDragNodeOrigin({ x: node.x, y: node.y });
             setIsDragging(true);
@@ -3299,18 +4473,29 @@ export function MeshEditor() {
           return;
         }
 
-        const distLoadBeamId = findDistLoadAtScreen(x, y);
-        if (distLoadBeamId !== null) {
+        const distLoadHit = findDistLoadAtScreen(x, y);
+        if (distLoadHit !== null) {
+          const { beamId, loadId } = distLoadHit;
           if (e.shiftKey) {
-            if (selection.distLoadBeamIds.has(distLoadBeamId)) {
-              dispatch({ type: 'DESELECT_DIST_LOAD', payload: distLoadBeamId });
+            // Toggle individual load selection with Shift
+            if (selection.selectedDistLoadIds.has(loadId)) {
+              dispatch({ type: 'DESELECT_INDIVIDUAL_DIST_LOAD', payload: loadId });
             } else {
-              dispatch({ type: 'SELECT_DIST_LOAD', payload: distLoadBeamId });
+              dispatch({ type: 'SELECT_INDIVIDUAL_DIST_LOAD', payload: loadId });
+              // Also track beam-level for backward compat
+              dispatch({ type: 'SELECT_DIST_LOAD', payload: beamId });
             }
           } else {
+            // Select only this specific load
             dispatch({
               type: 'SET_SELECTION',
-              payload: { nodeIds: new Set(), elementIds: new Set(), pointLoadNodeIds: new Set(), distLoadBeamIds: new Set([distLoadBeamId]) }
+              payload: {
+                nodeIds: new Set(),
+                elementIds: new Set(),
+                pointLoadNodeIds: new Set(),
+                distLoadBeamIds: new Set([beamId]),
+                selectedDistLoadIds: new Set([loadId])
+              }
             });
           }
           return;
@@ -3365,8 +4550,11 @@ export function MeshEditor() {
       {
         const world = screenToWorld(x, y);
         for (const plate of mesh.plateRegions.values()) {
-          if (world.x >= plate.x && world.x <= plate.x + plate.width &&
-              world.y >= plate.y && world.y <= plate.y + plate.height) {
+          const inPlate = plate.isPolygon && plate.polygon
+            ? pointInPolygon(world.x, world.y, plate.polygon) && !(plate.voids ?? []).some(v => pointInPolygon(world.x, world.y, v))
+            : world.x >= plate.x && world.x <= plate.x + plate.width &&
+              world.y >= plate.y && world.y <= plate.y + plate.height;
+          if (inPlate) {
             if (e.shiftKey) {
               if (selection.plateIds.has(plate.id)) {
                 dispatch({ type: 'DESELECT_PLATE', payload: plate.id });
@@ -3561,19 +4749,54 @@ export function MeshEditor() {
     if (selectedTool === 'addPlate') {
       const world = screenToWorld(x, y);
       const snapped = snapToGridFn(world.x, world.y);
-      if (!plateFirstCorner) {
-        setPlateFirstCorner(snapped);
-      } else {
-        // Compute rectangle from two corners
-        const x0 = Math.min(plateFirstCorner.x, snapped.x);
-        const y0 = Math.min(plateFirstCorner.y, snapped.y);
-        const w = Math.abs(snapped.x - plateFirstCorner.x);
-        const h = Math.abs(snapped.y - plateFirstCorner.y);
-        if (w > 0.001 && h > 0.001) {
-          setPendingPlateRect({ x: x0, y: y0, w, h });
-          setShowPlateDialog(true);
+
+      if (plateDrawMode === 'polygon') {
+        // Polygon plate drawing mode
+        if (plateEditState === 'outline') {
+          // Add vertex to outline polygon
+          // Check if clicking near first point to close the polygon
+          if (platePolygonPoints.length >= 3) {
+            const first = platePolygonPoints[0];
+            const dist = Math.sqrt((snapped.x - first.x) ** 2 + (snapped.y - first.y) ** 2);
+            if (dist < 0.05) { // close tolerance ~50mm
+              // Close the polygon
+              setPlateEditState(null);
+              return;
+            }
+          }
+          setPlatePolygonPoints(prev => [...prev, { x: snapped.x, y: snapped.y }]);
+        } else if (plateEditState === 'void') {
+          // Add vertex to current void polygon
+          if (currentVoidPoints.length >= 3) {
+            const first = currentVoidPoints[0];
+            const dist = Math.sqrt((snapped.x - first.x) ** 2 + (snapped.y - first.y) ** 2);
+            if (dist < 0.05) {
+              // Close the void polygon
+              setPlateVoids(prev => [...prev, [...currentVoidPoints]]);
+              setCurrentVoidPoints([]);
+              setPlateEditState(null);
+              return;
+            }
+          }
+          setCurrentVoidPoints(prev => [...prev, { x: snapped.x, y: snapped.y }]);
         }
-        setPlateFirstCorner(null);
+        // If plateEditState is null (toolbar showing), ignore clicks on canvas
+      } else {
+        // Rectangle plate drawing mode (existing behavior)
+        if (!plateFirstCorner) {
+          setPlateFirstCorner(snapped);
+        } else {
+          // Compute rectangle from two corners
+          const x0 = Math.min(plateFirstCorner.x, snapped.x);
+          const y0 = Math.min(plateFirstCorner.y, snapped.y);
+          const w = Math.abs(snapped.x - plateFirstCorner.x);
+          const h = Math.abs(snapped.y - plateFirstCorner.y);
+          if (w > 0.001 && h > 0.001) {
+            setPendingPlateRect({ x: x0, y: y0, w, h });
+            setShowPlateDialog(true);
+          }
+          setPlateFirstCorner(null);
+        }
       }
     }
 
@@ -3582,31 +4805,53 @@ export function MeshEditor() {
       // Find closest plate edge within tolerance
       const tolerance = 15 / viewState.scale;
       let closestPlateId: number | null = null;
-      let closestEdge: 'top' | 'bottom' | 'left' | 'right' = 'bottom';
+      let closestEdge: 'top' | 'bottom' | 'left' | 'right' | number = 'bottom';
       let closestDist = Infinity;
 
       for (const plate of mesh.plateRegions.values()) {
-        // Check each edge
-        const edges: Array<{ edge: 'top' | 'bottom' | 'left' | 'right'; x1: number; y1: number; x2: number; y2: number }> = [
-          { edge: 'bottom', x1: plate.x, y1: plate.y, x2: plate.x + plate.width, y2: plate.y },
-          { edge: 'top', x1: plate.x, y1: plate.y + plate.height, x2: plate.x + plate.width, y2: plate.y + plate.height },
-          { edge: 'left', x1: plate.x, y1: plate.y, x2: plate.x, y2: plate.y + plate.height },
-          { edge: 'right', x1: plate.x + plate.width, y1: plate.y, x2: plate.x + plate.width, y2: plate.y + plate.height },
-        ];
-        for (const e of edges) {
-          const dx = e.x2 - e.x1;
-          const dy = e.y2 - e.y1;
-          const lenSq = dx * dx + dy * dy;
-          if (lenSq === 0) continue;
-          let t = ((world.x - e.x1) * dx + (world.y - e.y1) * dy) / lenSq;
-          t = Math.max(0, Math.min(1, t));
-          const cx = e.x1 + t * dx;
-          const cy = e.y1 + t * dy;
-          const dist = Math.sqrt((world.x - cx) ** 2 + (world.y - cy) ** 2);
-          if (dist < closestDist && dist < tolerance) {
-            closestDist = dist;
-            closestPlateId = plate.id;
-            closestEdge = e.edge;
+        if (plate.isPolygon && plate.polygon && plate.polygon.length >= 3) {
+          // Polygon plate: check each polygon edge
+          for (let ei = 0; ei < plate.polygon.length; ei++) {
+            const v1 = plate.polygon[ei];
+            const v2 = plate.polygon[(ei + 1) % plate.polygon.length];
+            const dx = v2.x - v1.x;
+            const dy = v2.y - v1.y;
+            const lenSq = dx * dx + dy * dy;
+            if (lenSq === 0) continue;
+            let t = ((world.x - v1.x) * dx + (world.y - v1.y) * dy) / lenSq;
+            t = Math.max(0, Math.min(1, t));
+            const cx = v1.x + t * dx;
+            const cy = v1.y + t * dy;
+            const dist = Math.sqrt((world.x - cx) ** 2 + (world.y - cy) ** 2);
+            if (dist < closestDist && dist < tolerance) {
+              closestDist = dist;
+              closestPlateId = plate.id;
+              closestEdge = ei;  // polygon edge index
+            }
+          }
+        } else {
+          // Rectangular plate: check bounding box edges
+          const edges: Array<{ edge: 'top' | 'bottom' | 'left' | 'right'; x1: number; y1: number; x2: number; y2: number }> = [
+            { edge: 'bottom', x1: plate.x, y1: plate.y, x2: plate.x + plate.width, y2: plate.y },
+            { edge: 'top', x1: plate.x, y1: plate.y + plate.height, x2: plate.x + plate.width, y2: plate.y + plate.height },
+            { edge: 'left', x1: plate.x, y1: plate.y, x2: plate.x, y2: plate.y + plate.height },
+            { edge: 'right', x1: plate.x + plate.width, y1: plate.y, x2: plate.x + plate.width, y2: plate.y + plate.height },
+          ];
+          for (const e of edges) {
+            const dx = e.x2 - e.x1;
+            const dy = e.y2 - e.y1;
+            const lenSq = dx * dx + dy * dy;
+            if (lenSq === 0) continue;
+            let t = ((world.x - e.x1) * dx + (world.y - e.y1) * dy) / lenSq;
+            t = Math.max(0, Math.min(1, t));
+            const cx = e.x1 + t * dx;
+            const cy = e.y1 + t * dy;
+            const dist = Math.sqrt((world.x - cx) ** 2 + (world.y - cy) ** 2);
+            if (dist < closestDist && dist < tolerance) {
+              closestDist = dist;
+              closestPlateId = plate.id;
+              closestEdge = e.edge;
+            }
           }
         }
       }
@@ -3621,37 +4866,62 @@ export function MeshEditor() {
       const world = screenToWorld(x, y);
       // Check if clicked inside a plate region
       for (const plate of mesh.plateRegions.values()) {
-        if (world.x >= plate.x && world.x <= plate.x + plate.width &&
-            world.y >= plate.y && world.y <= plate.y + plate.height) {
+        const inPlate = plate.isPolygon && plate.polygon
+          ? pointInPolygon(world.x, world.y, plate.polygon) && !(plate.voids ?? []).some(v => pointInPolygon(world.x, world.y, v))
+          : world.x >= plate.x && world.x <= plate.x + plate.width &&
+            world.y >= plate.y && world.y <= plate.y + plate.height;
+        if (inPlate) {
           setThermalLoadElementIds(plate.elementIds);
           setThermalLoadPlateId(plate.id);
           return;
         }
       }
-      // Check if clicked on individual triangle element
+      // Check if clicked on individual element (triangle or quad)
       for (const element of mesh.elements.values()) {
         const nodes = mesh.getElementNodes(element);
-        if (nodes.length !== 3) continue;
-        // Point-in-triangle test
-        const [p1, p2, p3] = nodes;
-        const d1 = (world.x - p2.x) * (p1.y - p2.y) - (p1.x - p2.x) * (world.y - p2.y);
-        const d2 = (world.x - p3.x) * (p2.y - p3.y) - (p2.x - p3.x) * (world.y - p3.y);
-        const d3 = (world.x - p1.x) * (p3.y - p1.y) - (p3.x - p1.x) * (world.y - p1.y);
-        const hasNeg = (d1 < 0) || (d2 < 0) || (d3 < 0);
-        const hasPos = (d1 > 0) || (d2 > 0) || (d3 > 0);
-        if (!(hasNeg && hasPos)) {
-          setThermalLoadElementIds([element.id]);
-          setThermalLoadPlateId(undefined);
-          return;
+        if (nodes.length === 3) {
+          if (pointInTriangle(world, nodes[0], nodes[1], nodes[2])) {
+            setThermalLoadElementIds([element.id]);
+            setThermalLoadPlateId(undefined);
+            return;
+          }
+        } else if (nodes.length === 4) {
+          // Quad: test as two triangles
+          if (pointInTriangle(world, nodes[0], nodes[1], nodes[2]) ||
+              pointInTriangle(world, nodes[0], nodes[2], nodes[3])) {
+            setThermalLoadElementIds([element.id]);
+            setThermalLoadPlateId(undefined);
+            return;
+          }
         }
       }
+    }
+
+    // Sub-node tool: click on a beam to place a sub-node
+    if (selectedTool === 'addSubNode') {
+      const hit = findBeamAtScreenWithPosition(x, y);
+      if (hit) {
+        pushUndo();
+        const subNode = mesh.addSubNode(hit.beam.id, hit.t);
+        if (subNode) {
+          dispatch({ type: 'SET_RESULT', payload: null });
+          dispatch({ type: 'REFRESH_MESH' });
+        }
+      }
+      return;
     }
 
     if (selectedTool === 'delete') {
       const node = findNodeAtScreen(x, y);
       if (node) {
         pushUndo();
-        mesh.removeNode(node.id);
+        // If deleting a sub-node, use removeSubNode to rejoin the beam
+        const subNodeRecord = mesh.getSubNodeByNodeId(node.id);
+        if (subNodeRecord) {
+          mesh.removeSubNode(subNodeRecord.id);
+        } else {
+          mesh.removeNode(node.id);
+        }
         dispatch({ type: 'REFRESH_MESH' });
         return;
       }
@@ -3668,8 +4938,11 @@ export function MeshEditor() {
       const world = screenToWorld(x, y);
       let clickedPlateId: number | null = null;
       for (const plate of mesh.plateRegions.values()) {
-        if (world.x >= plate.x && world.x <= plate.x + plate.width &&
-            world.y >= plate.y && world.y <= plate.y + plate.height) {
+        const inPlate = plate.isPolygon && plate.polygon
+          ? pointInPolygon(world.x, world.y, plate.polygon) && !(plate.voids ?? []).some(v => pointInPolygon(world.x, world.y, v))
+          : world.x >= plate.x && world.x <= plate.x + plate.width &&
+            world.y >= plate.y && world.y <= plate.y + plate.height;
+        if (inPlate) {
           clickedPlateId = plate.id;
           break;
         }
@@ -3680,6 +4953,7 @@ export function MeshEditor() {
         const elementIds = plate ? [...plate.elementIds] : [];
         removePlateRegion(mesh, clickedPlateId);
         dispatch({ type: 'CLEANUP_PLATE_LOADS', payload: { plateId: clickedPlateId, elementIds } });
+        dispatch({ type: 'SET_RESULT', payload: null });
         dispatch({ type: 'REFRESH_MESH' });
         return;
       }
@@ -3698,6 +4972,10 @@ export function MeshEditor() {
     const mx = e.clientX - rect.left;
     const my = e.clientY - rect.top;
 
+    // Update mouse world position for status bar
+    const worldPos = screenToWorld(mx, my);
+    dispatch({ type: 'SET_MOUSE_WORLD_POS', payload: worldPos });
+
     // Track cursor position during move mode
     if (moveMode) {
       setCursorPos({ x: mx, y: my });
@@ -3707,6 +4985,13 @@ export function MeshEditor() {
     const nearNode = findNodeAtScreen(mx, my);
     const nearBeam = findBeamAtScreen(mx, my);
     setHoveredNodeId(nearNode?.id ?? null);
+
+    // Track tooltip position when hovering over a beam or node
+    if (nearNode || nearBeam) {
+      setTooltipPos({ x: mx, y: my });
+    } else {
+      setTooltipPos(null);
+    }
 
     // Track cursor position for constraint/beam/load tool preview
     if (isConstraintTool || selectedTool === 'addBeam') {
@@ -3743,8 +5028,27 @@ export function MeshEditor() {
         setSnapNodeId(null);
       }
       setHoveredBeamId(nearBeam?.id ?? null);
-    } else if (selectedTool === 'addNode' || selectedTool === 'addLoad' || selectedTool === 'addLineLoad') {
-      // Snap cursor preview to grid for addNode/addLoad tools
+    } else if (selectedTool === 'addSubNode') {
+      // Sub-node tool: show cursor snapped to nearest beam position
+      setHoveredBeamId(nearBeam?.id ?? null);
+      if (nearBeam) {
+        const hit = findBeamAtScreenWithPosition(mx, my);
+        if (hit) {
+          const nodes = mesh.getBeamElementNodes(hit.beam);
+          if (nodes) {
+            const [n1, n2] = nodes;
+            const px = n1.x + hit.t * (n2.x - n1.x);
+            const py = n1.y + hit.t * (n2.y - n1.y);
+            const screenSnapped = worldToScreen(px, py);
+            setCursorPos({ x: screenSnapped.x, y: screenSnapped.y });
+          }
+        }
+      } else {
+        setCursorPos(null);
+      }
+      setSnapNodeId(null);
+    } else if (selectedTool === 'addNode' || selectedTool === 'addLoad' || selectedTool === 'addLineLoad' || selectedTool === 'addPlate') {
+      // Snap cursor preview to grid for addNode/addLoad/addPlate tools
       const world = screenToWorld(mx, my);
       const snapped = snapToGridFn(world.x, world.y);
       const screenSnapped = worldToScreen(snapped.x, snapped.y);
@@ -3885,15 +5189,64 @@ export function MeshEditor() {
         let newX = snapped.x;
         let newY = snapped.y;
 
-        // Apply axis constraint from gizmo
-        if (gizmoAxis === 'x' && dragNodeOrigin) {
-          newY = dragNodeOrigin.y;
-        } else if (gizmoAxis === 'y' && dragNodeOrigin) {
-          newX = dragNodeOrigin.x;
+        // Check if dragging a sub-node: constrain movement along beam axis
+        const draggedSubNode = mesh.getSubNodeByNodeId(draggedNode);
+        if (draggedSubNode) {
+          const startNode = mesh.getNode(draggedSubNode.originalBeamStart);
+          const endNode = mesh.getNode(draggedSubNode.originalBeamEnd);
+          if (startNode && endNode) {
+            const bx = endNode.x - startNode.x;
+            const by = endNode.y - startNode.y;
+            const lenSq = bx * bx + by * by;
+            if (lenSq > 0) {
+              let t = ((newX - startNode.x) * bx + (newY - startNode.y) * by) / lenSq;
+              t = Math.max(0.01, Math.min(0.99, t));
+              newX = startNode.x + t * bx;
+              newY = startNode.y + t * by;
+              draggedSubNode.t = t;
+            }
+          }
+        } else {
+          // Apply axis constraint from gizmo (only for regular nodes)
+          if (gizmoAxis === 'x' && dragNodeOrigin) {
+            newY = dragNodeOrigin.y;
+          } else if (gizmoAxis === 'y' && dragNodeOrigin) {
+            newX = dragNodeOrigin.x;
+          }
         }
 
         mesh.updateNode(draggedNode, { x: newX, y: newY });
+
+        // Update sub-node positions if this node is an endpoint of beams with sub-nodes
+        if (!draggedSubNode) {
+          mesh.updateSubNodePositions(draggedNode);
+        }
+
         dispatch({ type: 'REFRESH_MESH' });
+
+        // Feature #17: Live result update during dragging
+        if (autoRecalculate && result) {
+          const now = Date.now();
+          if (now - lastLiveSolveRef.current > 200) {
+            lastLiveSolveRef.current = now;
+            setTimeout(async () => {
+              try {
+                const { solve } = await import('../../core/solver/SolverService');
+                const currentState = stateRef.current;
+                const currentMesh = meshRef.current;
+                const activeLc = currentState.loadCases.find(lc => lc.id === currentState.activeLoadCase);
+                if (activeLc) applyLoadCaseToMesh(currentMesh, activeLc);
+                const solveResult = await solve(currentMesh, {
+                  analysisType: currentState.analysisType,
+                  geometricNonlinear: false
+                });
+                dispatch({ type: 'SET_RESULT', payload: solveResult });
+              } catch {
+                // Silently ignore live-solve failures
+              }
+            }, 0);
+          }
+        }
       }
     } else {
       dispatch({
@@ -3923,9 +5276,13 @@ export function MeshEditor() {
         const selectedElements = new Set<number>();
         const selectedPointLoadNodes = new Set<number>();
         const selectedDistLoadBeams = new Set<number>();
+        const selectedDistLoadIds = new Set<number>();
 
         // Detect crossing (left-drag) vs window (right-drag)
         const isCrossing = selectionBox.endX < selectionBox.startX;
+
+        // Active load case for load selection
+        const activeLcForBox = loadCases.find(lc => lc.id === activeLoadCase);
 
         // Select nodes within box
         for (const node of mesh.nodes.values()) {
@@ -3950,16 +5307,27 @@ export function MeshEditor() {
           const midX = (s1.x + s2.x) / 2;
           const midY = (s1.y + s2.y) / 2;
 
-          // Also check load arrow symbolic area
+          // Also check load arrow symbolic area using load-case loads
           let loadTopInBox = false;
-          if (viewMode !== 'geometry' && beam.distributedLoad && beam.distributedLoad.qy !== 0) {
-            const angle = calculateBeamAngle(n1, n2);
-            const perpAngle = (beam.distributedLoad.coordSystem === 'global') ? Math.PI / 2 : angle + Math.PI / 2;
-            const arrowLen = Math.min(40, Math.abs(beam.distributedLoad.qy) / 500 * 40 + 20);
-            const sign = beam.distributedLoad.qy > 0 ? 1 : -1;
-            const topMidX = midX + Math.cos(perpAngle) * arrowLen * sign;
-            const topMidY = midY + Math.sin(perpAngle) * arrowLen * sign;
-            loadTopInBox = topMidX >= minX && topMidX <= maxX && topMidY >= minY && topMidY <= maxY;
+          const beamLoadsForBox = activeLcForBox?.distributedLoads.filter(dl => dl.elementId === beam.id) ?? [];
+          if (viewMode !== 'geometry' && beamLoadsForBox.length > 0) {
+            const screenAngle = Math.atan2(s2.y - s1.y, s2.x - s1.x);
+            let cumulativeOff = 0;
+            for (const dl of beamLoadsForBox) {
+              if (dl.qy === 0 && (dl.qyEnd ?? dl.qy) === 0) continue;
+              const isGlobal = (dl.coordSystem ?? 'local') === 'global';
+              const perpAngle = isGlobal ? Math.PI / 2 : screenAngle + Math.PI / 2;
+              const maxQ = Math.max(Math.abs(dl.qy), Math.abs(dl.qyEnd ?? dl.qy));
+              const arrowLen = Math.min(40, maxQ / 500 * 40 + 20);
+              const offset = cumulativeOff + arrowLen / 2;
+              const topMidX = midX + Math.cos(perpAngle) * offset;
+              const topMidY = midY + Math.sin(perpAngle) * offset;
+              if (topMidX >= minX && topMidX <= maxX && topMidY >= minY && topMidY <= maxY) {
+                loadTopInBox = true;
+                if (dl.id != null) selectedDistLoadIds.add(dl.id);
+              }
+              cumulativeOff += arrowLen + 4;
+            }
           }
 
           if (isCrossing) {
@@ -3968,16 +5336,22 @@ export function MeshEditor() {
             const crosses = lineIntersectsRect(s1.x, s1.y, s2.x, s2.y, minX, minY, maxX, maxY);
             if (midInside || crosses || loadTopInBox) {
               selectedElements.add(beam.id);
-              if (viewMode !== 'geometry' && beam.distributedLoad && beam.distributedLoad.qy !== 0) {
+              if (viewMode !== 'geometry' && beamLoadsForBox.length > 0) {
                 selectedDistLoadBeams.add(beam.id);
+                for (const dl of beamLoadsForBox) {
+                  if (dl.id != null) selectedDistLoadIds.add(dl.id);
+                }
               }
             }
           } else {
             // Window: select beams whose midpoint is fully inside box
             if ((midX >= minX && midX <= maxX && midY >= minY && midY <= maxY) || loadTopInBox) {
               selectedElements.add(beam.id);
-              if (viewMode !== 'geometry' && beam.distributedLoad && beam.distributedLoad.qy !== 0) {
+              if (viewMode !== 'geometry' && beamLoadsForBox.length > 0) {
                 selectedDistLoadBeams.add(beam.id);
+                for (const dl of beamLoadsForBox) {
+                  if (dl.id != null) selectedDistLoadIds.add(dl.id);
+                }
               }
             }
           }
@@ -3989,7 +5363,8 @@ export function MeshEditor() {
             nodeIds: selectedNodes,
             elementIds: selectedElements,
             pointLoadNodeIds: selectedPointLoadNodes,
-            distLoadBeamIds: selectedDistLoadBeams
+            distLoadBeamIds: selectedDistLoadBeams,
+            selectedDistLoadIds: selectedDistLoadIds
           }
         });
       } else {
@@ -4008,27 +5383,60 @@ export function MeshEditor() {
     if (resizingLoadBeamId !== null) {
       const beam = mesh.getBeamElement(resizingLoadBeamId);
       if (beam?.distributedLoad) {
-        const finalQy = beam.distributedLoad.qy;
-        // Dispatch to active load case
-        dispatch({
-          type: 'ADD_DISTRIBUTED_LOAD',
-          payload: {
-            lcId: state.activeLoadCase,
-            beamId: resizingLoadBeamId,
-            qx: beam.distributedLoad.qx,
-            qy: finalQy,
-            qxEnd: beam.distributedLoad.qxEnd,
-            qyEnd: beam.distributedLoad.qyEnd,
-            startT: beam.distributedLoad.startT,
-            endT: beam.distributedLoad.endT,
-            coordSystem: beam.distributedLoad.coordSystem
-          }
-        });
+        // Find the first load for this beam in the active load case and update it
+        const activeLc = state.loadCases.find(lc => lc.id === state.activeLoadCase);
+        const existingDl = activeLc?.distributedLoads.find(dl => dl.elementId === resizingLoadBeamId);
+        if (existingDl?.id != null) {
+          dispatch({
+            type: 'UPDATE_DISTRIBUTED_LOAD',
+            payload: {
+              lcId: state.activeLoadCase,
+              loadId: existingDl.id,
+              qx: beam.distributedLoad.qx,
+              qy: beam.distributedLoad.qy,
+              qxEnd: beam.distributedLoad.qxEnd,
+              qyEnd: beam.distributedLoad.qyEnd,
+              startT: beam.distributedLoad.startT,
+              endT: beam.distributedLoad.endT,
+              coordSystem: beam.distributedLoad.coordSystem
+            }
+          });
+        } else {
+          // Fallback: add as new load (for backward compatibility with loads without id)
+          dispatch({
+            type: 'ADD_DISTRIBUTED_LOAD',
+            payload: {
+              lcId: state.activeLoadCase,
+              beamId: resizingLoadBeamId,
+              qx: beam.distributedLoad.qx,
+              qy: beam.distributedLoad.qy,
+              qxEnd: beam.distributedLoad.qxEnd,
+              qyEnd: beam.distributedLoad.qyEnd,
+              startT: beam.distributedLoad.startT,
+              endT: beam.distributedLoad.endT,
+              coordSystem: beam.distributedLoad.coordSystem
+            }
+          });
+        }
       }
       setResizingLoadBeamId(null);
       setResizeStartQy(0);
       setResizingLoadEnd(null);
     }
+
+    // Re-mesh plate region if a corner/vertex node was dragged
+    if (draggedNode !== null) {
+      const plateCornerInfo = findPlateCornerForNode(mesh, draggedNode);
+      if (plateCornerInfo) {
+        if (plateCornerInfo.isPolygonVertex) {
+          remeshPolygonPlateRegion(mesh, plateCornerInfo.plateId, draggedNode);
+        } else {
+          remeshPlateRegion(mesh, plateCornerInfo.plateId);
+        }
+        dispatch({ type: 'REFRESH_MESH' });
+      }
+    }
+
     setIsDragging(false);
     setDraggedNode(null);
     setDragNodeOrigin(null);
@@ -4043,15 +5451,16 @@ export function MeshEditor() {
     const x = e.clientX - rect.left;
     const y = e.clientY - rect.top;
 
-    // Double-click on distributed load -> open LineLoadDialog (check before node/beam)
-    if (viewMode !== 'geometry') {
-      const distLoadBeamId = findDistLoadAtScreen(x, y);
-      if (distLoadBeamId !== null) {
-        dispatch({
-          type: 'SET_SELECTION',
-          payload: { nodeIds: new Set(), elementIds: new Set(), pointLoadNodeIds: new Set(), distLoadBeamIds: new Set([distLoadBeamId]) }
-        });
-        setLineLoadBeamId(distLoadBeamId);
+    // Double-click closes polygon in plate polygon drawing mode
+    if (selectedTool === 'addPlate' && plateDrawMode === 'polygon') {
+      if (plateEditState === 'outline' && platePolygonPoints.length >= 3) {
+        setPlateEditState(null); // close outline, show toolbar
+        return;
+      }
+      if (plateEditState === 'void' && currentVoidPoints.length >= 3) {
+        setPlateVoids(prev => [...prev, [...currentVoidPoints]]);
+        setCurrentVoidPoints([]);
+        setPlateEditState(null);
         return;
       }
     }
@@ -4063,7 +5472,7 @@ export function MeshEditor() {
       return;
     }
 
-    // Double-click on a bar -> check if near UC badge first, then open bar properties
+    // Double-click on a bar -> open bar properties (always takes priority over line load)
     const beam = findBeamAtScreen(x, y);
     if (beam) {
       // Check if click is near the UC badge (75% along beam)
@@ -4088,16 +5497,36 @@ export function MeshEditor() {
       return;
     }
 
-    // Double-click on a plate region -> show plate info (future: plate properties dialog)
-    const world = screenToWorld(x, y);
-    for (const plate of mesh.plateRegions.values()) {
-      if (world.x >= plate.x && world.x <= plate.x + plate.width &&
-          world.y >= plate.y && world.y <= plate.y + plate.height) {
-        // Select the plate
+    // Double-click on distributed load arrows (not on beam line) -> open LineLoadDialog for THAT specific load
+    if (viewMode !== 'geometry') {
+      const distLoadHit = findDistLoadAtScreen(x, y);
+      if (distLoadHit !== null) {
+        const { beamId, loadId } = distLoadHit;
         dispatch({
           type: 'SET_SELECTION',
-          payload: { nodeIds: new Set(), elementIds: new Set(), pointLoadNodeIds: new Set(), distLoadBeamIds: new Set(), plateIds: new Set([plate.id]) }
+          payload: {
+            nodeIds: new Set(),
+            elementIds: new Set(),
+            pointLoadNodeIds: new Set(),
+            distLoadBeamIds: new Set([beamId]),
+            selectedDistLoadIds: new Set([loadId])
+          }
         });
+        setLineLoadBeamId(beamId);
+        setEditingDistLoadId(loadId);
+        return;
+      }
+    }
+
+    // Double-click on a plate region -> open plate properties dialog
+    const world = screenToWorld(x, y);
+    for (const plate of mesh.plateRegions.values()) {
+      const inPlate = plate.isPolygon && plate.polygon
+        ? pointInPolygon(world.x, world.y, plate.polygon) && !(plate.voids ?? []).some(v => pointInPolygon(world.x, world.y, v))
+        : world.x >= plate.x && world.x <= plate.x + plate.width &&
+          world.y >= plate.y && world.y <= plate.y + plate.height;
+      if (inPlate) {
+        setEditingPlateId(plate.id);
         return;
       }
     }
@@ -4133,7 +5562,7 @@ export function MeshEditor() {
         onMouseDown={handleMouseDown}
         onMouseMove={handleMouseMove}
         onMouseUp={handleMouseUp}
-        onMouseLeave={() => { handleMouseUp(); setCursorPos(null); setGizmoAxis(null); }}
+        onMouseLeave={() => { handleMouseUp(); setCursorPos(null); setGizmoAxis(null); dispatch({ type: 'SET_MOUSE_WORLD_POS', payload: null }); }}
         onDoubleClick={handleDoubleClick}
         onWheel={handleWheel}
         onContextMenu={e => {
@@ -4145,6 +5574,34 @@ export function MeshEditor() {
             setPendingCommand(null);
           } else if (editingDimension) {
             setEditingDimension(null);
+          } else if (selectedTool === 'addPlate' && plateDrawMode === 'polygon' && (plateEditState !== null || platePolygonPoints.length > 0)) {
+            // Right-click closes polygon if >= 3 points, cancels if < 3
+            if (plateEditState === 'outline' && platePolygonPoints.length >= 3) {
+              // Close the outline polygon — same as Enter/double-click
+              setPlateEditState(null);
+            } else if (plateEditState === 'void' && currentVoidPoints.length >= 3) {
+              // Close the void polygon
+              setPlateVoids(prev => [...prev, [...currentVoidPoints]]);
+              setCurrentVoidPoints([]);
+              setPlateEditState(null);
+            } else if (plateEditState === 'void' && currentVoidPoints.length > 0) {
+              // Cancel current void (< 3 points)
+              setCurrentVoidPoints([]);
+              setPlateEditState(null);
+            } else if (plateEditState === 'outline' && platePolygonPoints.length > 0) {
+              // Cancel outline (< 3 points)
+              setPlatePolygonPoints([]);
+              setPlateEditState(null);
+            } else {
+              // Cancel the whole polygon plate
+              setPlatePolygonPoints([]);
+              setPlateVoids([]);
+              setCurrentVoidPoints([]);
+              setPlateEditState(null);
+            }
+          } else if (pendingNodes.length > 0) {
+            // Right-click with pending nodes: cancel the current chain but stay in the tool
+            dispatch({ type: 'CLEAR_PENDING_NODES' });
           } else if (selectedTool !== 'select') {
             dispatch({ type: 'SET_TOOL', payload: 'select' });
           }
@@ -4152,7 +5609,7 @@ export function MeshEditor() {
         style={{
           cursor: moveMode ? 'move'
             : isConstraintTool ? 'none'
-            : (selectedTool === 'addLoad' || selectedTool === 'addLineLoad' || selectedTool === 'addPlate' || selectedTool === 'addEdgeLoad' || selectedTool === 'addThermalLoad') ? 'crosshair'
+            : (selectedTool === 'addLoad' || selectedTool === 'addLineLoad' || selectedTool === 'addPlate' || selectedTool === 'addEdgeLoad' || selectedTool === 'addThermalLoad' || selectedTool === 'addSubNode') ? 'crosshair'
             : gizmoAxis === 'x' ? 'ew-resize'
             : gizmoAxis === 'y' ? 'ns-resize'
             : gizmoAxis === 'free' ? 'grab'
@@ -4160,9 +5617,156 @@ export function MeshEditor() {
             : 'default'
         }}
       />
+      {/* Zoom controls overlay */}
+      <div className="zoom-controls">
+        <button
+          className="zoom-control-btn"
+          onClick={() => {
+            const newScale = Math.min(500, viewState.scale * 1.2);
+            const cx = (canvasRef.current?.width ?? 800) / 2;
+            const cy = (canvasRef.current?.height ?? 600) / 2;
+            const worldX = (cx - viewState.offsetX) / viewState.scale;
+            const worldY = (cy - viewState.offsetY) / viewState.scale;
+            dispatch({ type: 'SET_VIEW_STATE', payload: { scale: newScale, offsetX: cx - worldX * newScale, offsetY: cy - worldY * newScale } });
+          }}
+          title="Zoom In"
+        >
+          +
+        </button>
+        <span className="zoom-level">{Math.round(viewState.scale)}%</span>
+        <button
+          className="zoom-control-btn"
+          onClick={() => {
+            const newScale = Math.max(10, viewState.scale / 1.2);
+            const cx = (canvasRef.current?.width ?? 800) / 2;
+            const cy = (canvasRef.current?.height ?? 600) / 2;
+            const worldX = (cx - viewState.offsetX) / viewState.scale;
+            const worldY = (cy - viewState.offsetY) / viewState.scale;
+            dispatch({ type: 'SET_VIEW_STATE', payload: { scale: newScale, offsetX: cx - worldX * newScale, offsetY: cy - worldY * newScale } });
+          }}
+          title="Zoom Out"
+        >
+          -
+        </button>
+      </div>
+      {/* Hover tooltip for beams and nodes */}
+      {tooltipPos && selectedTool === 'select' && !isDragging && (hoveredBeamId !== null || hoveredNodeId !== null) && (() => {
+        const lines: string[] = [];
+        if (hoveredNodeId !== null && hoveredBeamId === null) {
+          const node = mesh.getNode(hoveredNodeId);
+          if (node) {
+            lines.push(`Node ${node.id}`);
+            lines.push(`X: ${(node.x * 1000).toFixed(0)} mm  (${node.x.toFixed(3)} m)`);
+            lines.push(`Y: ${(node.y * 1000).toFixed(0)} mm  (${node.y.toFixed(3)} m)`);
+            const cx = node.constraints.x;
+            const cy = node.constraints.y;
+            const cr = node.constraints.rotation;
+            if (cx || cy || cr) {
+              const parts: string[] = [];
+              if (cx) parts.push('X');
+              if (cy) parts.push('Y');
+              if (cr) parts.push('Rot');
+              lines.push(`Constraints: ${parts.join(', ')}`);
+            } else {
+              lines.push('Constraints: Free');
+            }
+          }
+        } else if (hoveredBeamId !== null) {
+          const beam = mesh.getBeamElement(hoveredBeamId);
+          if (beam) {
+            const beamNodes = mesh.getBeamElementNodes(beam);
+            const length = beamNodes ? calculateBeamLength(beamNodes[0], beamNodes[1]) : 0;
+            const mat = mesh.getMaterial(beam.materialId);
+            lines.push(`Beam ${beam.id}`);
+            if (beam.profileName) lines.push(`Profile: ${beam.profileName}`);
+            if (mat) lines.push(`Material: ${mat.name}`);
+            lines.push(`Length: ${(length * 1000).toFixed(0)} mm`);
+            lines.push(`A = ${(beam.section.A * 1e4).toFixed(2)} cm\u00B2`);
+            lines.push(`I = ${(beam.section.I * 1e8).toFixed(1)} cm\u2074`);
+          }
+        }
+        if (lines.length === 0) return null;
+        return (
+          <div
+            className="mesh-tooltip"
+            style={{
+              left: tooltipPos.x + 14,
+              top: tooltipPos.y + 14
+            }}
+          >
+            {lines.map((line, i) => (
+              <div key={i}>{line}</div>
+            ))}
+          </div>
+        );
+      })()}
       {moveMode && (
         <div className="command-indicator">
           Click to place, Escape to cancel
+        </div>
+      )}
+      {selectedTool === 'addPlate' && plateDrawMode === 'rectangle' && !showPlateDialog && (
+        <div className="command-indicator">
+          Click two corners for rectangle. Press P for polygon mode.
+        </div>
+      )}
+      {selectedTool === 'addPlate' && plateDrawMode === 'polygon' && plateEditState === 'outline' && (
+        <div className="command-indicator">
+          Click to add vertices. Double-click or Enter to close polygon. Esc to cancel.
+        </div>
+      )}
+      {selectedTool === 'addPlate' && plateDrawMode === 'polygon' && plateEditState === 'void' && (
+        <div className="command-indicator">
+          Drawing void: Click to add vertices. Double-click or Enter to close. Esc to cancel.
+        </div>
+      )}
+      {selectedTool === 'addPlate' && plateDrawMode === 'polygon' && plateEditState === null && platePolygonPoints.length >= 3 && !showPlateDialog && (
+        <div className="plate-polygon-toolbar">
+          <span className="plate-polygon-toolbar-label">
+            Polygon plate ({platePolygonPoints.length} vertices{plateVoids.length > 0 ? `, ${plateVoids.length} void(s)` : ''})
+          </span>
+          <button
+            className="plate-polygon-toolbar-btn void-btn"
+            onClick={() => setPlateEditState('void')}
+          >
+            Add Void
+          </button>
+          <button
+            className="plate-polygon-toolbar-btn finish-btn"
+            onClick={() => {
+              // Compute bounding box from polygon points
+              const xs = platePolygonPoints.map(p => p.x);
+              const ys = platePolygonPoints.map(p => p.y);
+              const minXP = Math.min(...xs);
+              const maxXP = Math.max(...xs);
+              const minYP = Math.min(...ys);
+              const maxYP = Math.max(...ys);
+              const bboxW = maxXP - minXP;
+              const bboxH = maxYP - minYP;
+              if (bboxW > 0.001 && bboxH > 0.001) {
+                setPendingPolygonPlate({
+                  outline: [...platePolygonPoints],
+                  voids: [...plateVoids],
+                  bbox: { x: minXP, y: minYP, w: bboxW, h: bboxH }
+                });
+                setPendingPlateRect({ x: minXP, y: minYP, w: bboxW, h: bboxH });
+                setShowPlateDialog(true);
+              }
+            }}
+          >
+            Finish
+          </button>
+          <button
+            className="plate-polygon-toolbar-btn cancel-btn"
+            onClick={() => {
+              setPlatePolygonPoints([]);
+              setPlateVoids([]);
+              setCurrentVoidPoints([]);
+              setPlateEditState(null);
+            }}
+          >
+            Cancel
+          </button>
         </div>
       )}
       {beamLengthInput !== null && selectedTool === 'addBeam' && pendingNodes.length === 1 && (
@@ -4329,10 +5933,14 @@ export function MeshEditor() {
         const nodes = mesh.getBeamElementNodes(beam);
         if (!nodes) return null;
         const length = calculateBeamLength(nodes[0], nodes[1]);
+        const beamMaterial = mesh.getMaterial(beam.materialId);
+        const editBarForces = result?.beamForces.get(editingBarId);
         return (
           <BarPropertiesDialog
             beam={beam}
             length={length}
+            material={beamMaterial}
+            beamForces={editBarForces}
             onUpdate={(updates) => {
               pushUndo();
               mesh.updateBeamElement(editingBarId, updates);
@@ -4346,38 +5954,87 @@ export function MeshEditor() {
       {lineLoadBeamId !== null && (() => {
         const beam = mesh.getBeamElement(lineLoadBeamId);
         if (!beam) return null;
-        const activeLc = state.loadCases.find(lc => lc.id === state.activeLoadCase);
-        const existingDl = activeLc?.distributedLoads.find(dl => dl.elementId === lineLoadBeamId);
         const beamNodes = mesh.getBeamElementNodes(beam);
         const beamLen = beamNodes ? calculateBeamLength(beamNodes[0], beamNodes[1]) : undefined;
+
+        // If editingDistLoadId is set, find the existing load to pre-fill the dialog
+        const editingLc = state.loadCases.find(lc => lc.id === state.activeLoadCase);
+        const existingLoad = editingDistLoadId != null
+          ? editingLc?.distributedLoads.find(dl => dl.id === editingDistLoadId)
+          : null;
+
         return (
           <LineLoadDialog
-            initialQx={existingDl?.qx ?? 0}
-            initialQy={existingDl?.qy ?? 0}
-            initialQxEnd={existingDl?.qxEnd}
-            initialQyEnd={existingDl?.qyEnd}
-            initialStartT={beam.distributedLoad?.startT}
-            initialEndT={beam.distributedLoad?.endT}
-            initialCoordSystem={beam.distributedLoad?.coordSystem}
+            initialQx={existingLoad ? existingLoad.qx : 0}
+            initialQy={existingLoad ? existingLoad.qy : 0}
+            initialQxEnd={existingLoad?.qxEnd}
+            initialQyEnd={existingLoad?.qyEnd}
+            initialStartT={existingLoad?.startT ?? 0}
+            initialEndT={existingLoad?.endT ?? 1}
+            initialCoordSystem={existingLoad?.coordSystem ?? 'local'}
+            initialDescription={existingLoad?.description ?? ''}
             beamLength={beamLen}
             loadCases={state.loadCases}
             activeLoadCase={state.activeLoadCase}
-            onApply={(qx, qy, lcId, startT, endT, coordSystem, qxEnd, qyEnd) => {
+            onApply={(qx, qy, lcId, startT, endT, coordSystem, qxEnd, qyEnd, description) => {
               pushUndo();
-              dispatch({
-                type: 'ADD_DISTRIBUTED_LOAD',
-                payload: { lcId, beamId: lineLoadBeamId, qx, qy, qxEnd, qyEnd, startT, endT, coordSystem }
-              });
-              // Also apply to mesh for rendering (with partial load and coord system)
-              mesh.updateBeamElement(lineLoadBeamId, {
-                distributedLoad: { qx, qy, qxEnd, qyEnd, startT, endT, coordSystem }
-              });
+              if (existingLoad && existingLoad.id != null) {
+                // Update existing load
+                dispatch({
+                  type: 'UPDATE_DISTRIBUTED_LOAD',
+                  payload: { lcId, loadId: existingLoad.id, qx, qy, qxEnd, qyEnd, startT, endT, coordSystem, description }
+                });
+              } else {
+                // Add new load
+                dispatch({
+                  type: 'ADD_DISTRIBUTED_LOAD',
+                  payload: { lcId, beamId: lineLoadBeamId, qx, qy, qxEnd, qyEnd, startT, endT, coordSystem, description }
+                });
+              }
+              // Re-apply load case to mesh for rendering (combines all loads)
+              const updatedLc = state.loadCases.find(lc => lc.id === lcId);
+              if (updatedLc) {
+                // Clear beam's distributed load first, then re-apply all loads for this beam
+                mesh.updateBeamElement(lineLoadBeamId, { distributedLoad: undefined });
+                const allLoadsForBeam = [...updatedLc.distributedLoads.filter(dl => dl.elementId === lineLoadBeamId)];
+                if (existingLoad && existingLoad.id != null) {
+                  // Replace the existing load in the combined list
+                  const idx = allLoadsForBeam.findIndex(dl => dl.id === existingLoad.id);
+                  if (idx >= 0) {
+                    allLoadsForBeam[idx] = { ...allLoadsForBeam[idx], qx, qy, qxEnd, qyEnd, startT, endT, coordSystem, description };
+                  }
+                } else {
+                  // Also include the new load being added (since state hasn't updated yet)
+                  allLoadsForBeam.push({ elementId: lineLoadBeamId, qx, qy, qxEnd, qyEnd, startT, endT, coordSystem, description });
+                }
+                let combined = { qx: 0, qy: 0, qxEnd: 0, qyEnd: 0, startT: 0 as number, endT: 1 as number, coordSystem: coordSystem as 'local' | 'global' | undefined };
+                for (const dl of allLoadsForBeam) {
+                  combined.qx += dl.qx;
+                  combined.qy += dl.qy;
+                  combined.qxEnd += (dl.qxEnd ?? dl.qx);
+                  combined.qyEnd += (dl.qyEnd ?? dl.qy);
+                  combined.startT = Math.min(combined.startT, dl.startT ?? 0);
+                  combined.endT = Math.max(combined.endT, dl.endT ?? 1);
+                  if (dl.coordSystem) combined.coordSystem = dl.coordSystem;
+                }
+                mesh.updateBeamElement(lineLoadBeamId, { distributedLoad: combined });
+              }
               dispatch({ type: 'REFRESH_MESH' });
               dispatch({ type: 'SET_RESULT', payload: null });
               dispatch({ type: 'SET_VIEW_MODE', payload: 'loads' });
               setLineLoadBeamId(null);
+              setEditingDistLoadId(null);
             }}
-            onCancel={() => setLineLoadBeamId(null)}
+            onCancel={() => { setLineLoadBeamId(null); setEditingDistLoadId(null); }}
+            onPreview={(pQx, pQy, pCoord, pStartT, pEndT, pQxEnd, pQyEnd) => {
+              // Live preview: show existing loads + new preview load combined on the mesh
+              // Note: existing loads from load case are drawn separately per-load in the render loop
+              // This preview updates beam.distributedLoad for the fallback path
+              mesh.updateBeamElement(lineLoadBeamId, {
+                distributedLoad: { qx: pQx, qy: pQy, qxEnd: pQxEnd, qyEnd: pQyEnd, startT: pStartT, endT: pEndT, coordSystem: pCoord }
+              });
+              dispatch({ type: 'REFRESH_MESH' });
+            }}
           />
         );
       })()}
@@ -4385,16 +6042,43 @@ export function MeshEditor() {
         <PlateDialog
           rectWidth={pendingPlateRect.w}
           rectHeight={pendingPlateRect.h}
+          drawMode={plateDrawMode}
+          polygonVertices={pendingPolygonPlate?.outline}
+          polygonVoids={pendingPolygonPlate?.voids}
+          onDrawModeChange={(mode) => {
+            setPlateDrawMode(mode);
+            if (mode === 'polygon' && !pendingPolygonPlate) {
+              // Switch to polygon mode but cancel the current rect flow
+              setShowPlateDialog(false);
+              setPendingPlateRect(null);
+              setPlateEditState('outline');
+            }
+          }}
           materials={Array.from(mesh.materials.values()).map(m => ({ id: m.id, name: m.name }))}
           onConfirm={(config) => {
             pushUndo();
-            const plate = generatePlateRegionMesh(mesh, {
-              x: pendingPlateRect.x,
-              y: pendingPlateRect.y,
-              width: pendingPlateRect.w,
-              height: pendingPlateRect.h,
-              ...config
-            });
+
+            let plate;
+            if (pendingPolygonPlate && config.meshSize !== undefined) {
+              // Polygon mode: voxelized quad grid
+              plate = generatePolygonPlateMesh(mesh, {
+                outline: pendingPolygonPlate.outline,
+                voids: pendingPolygonPlate.voids.length > 0 ? pendingPolygonPlate.voids : undefined,
+                meshSize: config.meshSize,
+                materialId: config.materialId,
+                thickness: config.thickness,
+              });
+            } else {
+              // Rectangle mode: grid-based quad mesh
+              plate = generatePlateRegionMesh(mesh, {
+                x: pendingPlateRect.x,
+                y: pendingPlateRect.y,
+                width: pendingPlateRect.w,
+                height: pendingPlateRect.h,
+                ...config
+              });
+            }
+
             mesh.addPlateRegion(plate);
             dispatch({ type: 'REFRESH_MESH' });
             dispatch({ type: 'SET_RESULT', payload: null });
@@ -4404,18 +6088,28 @@ export function MeshEditor() {
             }
             setShowPlateDialog(false);
             setPendingPlateRect(null);
+            // Clear polygon state
+            setPlatePolygonPoints([]);
+            setPlateVoids([]);
+            setCurrentVoidPoints([]);
+            setPendingPolygonPlate(null);
+            setPlateEditState(null);
           }}
           onCancel={() => {
             setShowPlateDialog(false);
             setPendingPlateRect(null);
+            setPendingPolygonPlate(null);
           }}
         />
       )}
-      {edgeLoadPlateId !== null && (
+      {edgeLoadPlateId !== null && (() => {
+        const edgePlate = mesh.plateRegions.get(edgeLoadPlateId);
+        return (
         <EdgeLoadDialog
           edge={edgeLoadEdge}
           loadCases={state.loadCases}
           activeLoadCase={state.activeLoadCase}
+          polygon={edgePlate?.isPolygon ? edgePlate.polygon : undefined}
           onApply={(px, py, lcId, edge) => {
             pushUndo();
             dispatch({
@@ -4434,7 +6128,42 @@ export function MeshEditor() {
           }}
           onCancel={() => setEdgeLoadPlateId(null)}
         />
-      )}
+        );
+      })()}
+      {editingPlateId !== null && (() => {
+        const plate = mesh.plateRegions.get(editingPlateId);
+        if (!plate) return null;
+        return (
+          <PlatePropertiesDialog
+            plate={plate}
+            materials={Array.from(mesh.materials.values())}
+            onUpdate={(updates) => {
+              pushUndo();
+              const p = mesh.plateRegions.get(editingPlateId);
+              if (!p) return;
+              if (updates.thickness !== undefined) {
+                p.thickness = updates.thickness;
+                // Also update thickness on all plate elements
+                for (const elemId of p.elementIds) {
+                  const elem = mesh.getElement(elemId);
+                  if (elem) elem.thickness = updates.thickness;
+                }
+              }
+              if (updates.materialId !== undefined) {
+                p.materialId = updates.materialId;
+                for (const elemId of p.elementIds) {
+                  const elem = mesh.getElement(elemId);
+                  if (elem) elem.materialId = updates.materialId;
+                }
+              }
+              mesh.plateRegions.set(editingPlateId, p);
+              dispatch({ type: 'REFRESH_MESH' });
+              dispatch({ type: 'SET_RESULT', payload: null });
+            }}
+            onClose={() => setEditingPlateId(null)}
+          />
+        );
+      })()}
       {thermalLoadElementIds.length > 0 && (
         <ThermalLoadDialog
           elementIds={thermalLoadElementIds}

@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { FEMProvider, useFEM, applyLoadCaseToMesh, applyCombinedLoadsToMesh } from './context/FEMContext';
 import { solve } from './core/solver/SolverService';
+import { calculateEnvelope } from './core/solver/EnvelopeCalculator';
 import { Ribbon } from './components/Ribbon/Ribbon';
 import { ProjectBrowser } from './components/ProjectBrowser/ProjectBrowser';
 import { MeshEditor } from './components/MeshEditor/MeshEditor';
@@ -12,10 +13,14 @@ import { ProjectInfoDialog } from './components/ProjectInfoDialog/ProjectInfoDia
 import { StandardsDialog } from './components/StandardsDialog/StandardsDialog';
 import { GridsDialog } from './components/GridsDialog/GridsDialog';
 import { AgentPanel } from './components/AgentPanel/AgentPanel';
+import { MaterialsDialog } from './components/MaterialsDialog/MaterialsDialog';
 import { Preview3D } from './components/Preview3D/Preview3D';
 import { SteelCheckPanel } from './components/SteelCheckPanel/SteelCheckPanel';
+import { SteelCheckReport } from './components/SteelCheckReport/SteelCheckReport';
 import { ConcreteCheckPanel } from './components/ConcreteCheckPanel/ConcreteCheckPanel';
+import { CalculationSettingsDialog } from './components/CalculationSettingsDialog/CalculationSettingsDialog';
 import { FileTabs, FileTab } from './components/FileTabs/FileTabs';
+import { StatusBar } from './components/StatusBar/StatusBar';
 import { serializeProject, deserializeProject } from './core/io/ProjectSerializer';
 import { Box } from 'lucide-react';
 
@@ -47,7 +52,10 @@ function AppContent({ onSnapshotRef, fileTabs }: AppContentProps) {
   const [showGridsDialog, setShowGridsDialog] = useState(false);
   const [showAgentPanel, setShowAgentPanel] = useState(false);
   const [showSteelCheck, setShowSteelCheck] = useState(false);
+  const [showSteelCheckReport, setShowSteelCheckReport] = useState(false);
   const [showConcreteCheck, setShowConcreteCheck] = useState(false);
+  const [showMaterialsDialog, setShowMaterialsDialog] = useState(false);
+  const [showCalculationSettings, setShowCalculationSettings] = useState(false);
   const [browserCollapsed, setBrowserCollapsed] = useState(false);
   const [displayCollapsed, setDisplayCollapsed] = useState(false);
 
@@ -82,7 +90,9 @@ function AppContent({ onSnapshotRef, fileTabs }: AppContentProps) {
           dispatch({ type: 'SET_SHOW_MOMENT', payload: true });
         }
       })
-      .catch(() => {});
+      .catch((err: Error) => {
+        dispatch({ type: 'SET_SOLVER_ERROR', payload: err.message || 'Solver failed' });
+      });
   }, [state.mesh, state.loadCases, state.loadCombinations, state.activeLoadCase, state.activeCombination, state.analysisType, dispatch]);
 
   // Auto-recalculate: debounced solver trigger on mesh changes
@@ -120,7 +130,11 @@ function AppContent({ onSnapshotRef, fileTabs }: AppContentProps) {
             dispatch({ type: 'SET_RESULT', payload: result });
           }
         })
-        .catch(() => {});
+        .catch((err: Error) => {
+          if (!controller.signal.aborted) {
+            dispatch({ type: 'SET_SOLVER_ERROR', payload: err.message || 'Solver failed' });
+          }
+        });
     }, 300);
 
     return () => {
@@ -128,6 +142,51 @@ function AppContent({ onSnapshotRef, fileTabs }: AppContentProps) {
       if (autoRecalcAbort.current) autoRecalcAbort.current.abort();
     };
   }, [state.meshVersion, state.autoRecalculate, state.activeLoadCase, state.analysisType, state.activeCombination]);
+
+  // Envelope computation: when showEnvelope is toggled on and combinations exist,
+  // solve for each combination and compute the envelope of results.
+  useEffect(() => {
+    if (!state.showEnvelope) {
+      dispatch({ type: 'SET_ENVELOPE_RESULT', payload: null });
+      return;
+    }
+    if (state.loadCombinations.length === 0 || state.mesh.getNodeCount() < 2) return;
+
+    let cancelled = false;
+
+    const computeEnvelope = async () => {
+      const results = [];
+      for (const combo of state.loadCombinations) {
+        if (cancelled) return;
+        try {
+          applyCombinedLoadsToMesh(state.mesh, state.loadCases, combo);
+          const result = await solve(state.mesh, {
+            analysisType: state.analysisType,
+            geometricNonlinear: false
+          });
+          results.push(result);
+        } catch {
+          // Skip failed combinations
+        }
+      }
+      if (cancelled || results.length === 0) return;
+      const envelope = calculateEnvelope(results);
+      dispatch({ type: 'SET_ENVELOPE_RESULT', payload: envelope });
+
+      // Restore the active load case / combination on the mesh
+      if (state.activeCombination !== null) {
+        const combo = state.loadCombinations.find(c => c.id === state.activeCombination);
+        if (combo) applyCombinedLoadsToMesh(state.mesh, state.loadCases, combo);
+      } else {
+        const activeLc = state.loadCases.find(lc => lc.id === state.activeLoadCase);
+        if (activeLc) applyLoadCaseToMesh(state.mesh, activeLc);
+      }
+    };
+
+    computeEnvelope();
+
+    return () => { cancelled = true; };
+  }, [state.showEnvelope, state.loadCombinations, state.meshVersion, state.analysisType]);
 
   return (
     <div className="app">
@@ -147,6 +206,8 @@ function AppContent({ onSnapshotRef, fileTabs }: AppContentProps) {
         onShowGridsDialog={() => setShowGridsDialog(true)}
         onShowSteelCheck={() => setShowSteelCheck(true)}
         onShowConcreteCheck={() => setShowConcreteCheck(true)}
+        onShowMaterialsDialog={() => setShowMaterialsDialog(true)}
+        onShowCalculationSettings={() => setShowCalculationSettings(true)}
         onToggleAgent={() => setShowAgentPanel(!showAgentPanel)}
         showAgentPanel={showAgentPanel}
       />
@@ -166,6 +227,7 @@ function AppContent({ onSnapshotRef, fileTabs }: AppContentProps) {
         {showAgentPanel && <AgentPanel onClose={() => setShowAgentPanel(false)} />}
       </div>
       <LoadCaseTabs onSolve={handleSolve} />
+      <StatusBar />
 
       {showLoadCaseDialog && (
         <LoadCaseDialog onClose={() => setShowLoadCaseDialog(false)} />
@@ -185,8 +247,43 @@ function AppContent({ onSnapshotRef, fileTabs }: AppContentProps) {
       {showSteelCheck && (
         <SteelCheckPanel onClose={() => setShowSteelCheck(false)} />
       )}
+      {showSteelCheckReport && (
+        <SteelCheckReport onClose={() => setShowSteelCheckReport(false)} />
+      )}
       {showConcreteCheck && (
         <ConcreteCheckPanel onClose={() => setShowConcreteCheck(false)} />
+      )}
+      {showMaterialsDialog && (
+        <MaterialsDialog
+          materials={Array.from(state.mesh.materials.values())}
+          onAdd={(material) => {
+            state.mesh.addMaterial(material);
+            dispatch({ type: 'REFRESH_MESH' });
+          }}
+          onUpdate={(id, updates) => {
+            const mat = state.mesh.getMaterial(id);
+            if (mat) {
+              Object.assign(mat, updates);
+              state.mesh.materials.set(id, mat);
+              dispatch({ type: 'REFRESH_MESH' });
+            }
+          }}
+          onDelete={(id) => {
+            // Don't delete if any elements use this material
+            const inUse = Array.from(state.mesh.elements.values()).some(e => e.materialId === id) ||
+                          Array.from(state.mesh.beamElements.values()).some(e => e.materialId === id);
+            if (inUse) {
+              alert('Cannot delete: material is in use by one or more elements.');
+              return;
+            }
+            state.mesh.materials.delete(id);
+            dispatch({ type: 'REFRESH_MESH' });
+          }}
+          onClose={() => setShowMaterialsDialog(false)}
+        />
+      )}
+      {showCalculationSettings && (
+        <CalculationSettingsDialog onClose={() => setShowCalculationSettings(false)} />
       )}
     </div>
   );

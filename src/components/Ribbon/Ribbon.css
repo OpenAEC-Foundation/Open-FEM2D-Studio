@@ -26,7 +26,7 @@
 
 .ribbon-tab:hover {
   color: var(--text-primary);
-  background: rgba(255, 255, 255, 0.04);
+  background: rgba(128, 128, 128, 0.08);
 }
 
 .ribbon-tab.active {
@@ -38,7 +38,7 @@
 .ribbon-content {
   display: flex;
   padding: 6px 10px;
-  height: 140px;
+  height: 160px;
   overflow: hidden;
   gap: 4px;
 }
@@ -356,4 +356,29 @@
 
 .ribbon-dropdown {
   position: relative;
+}
+
+/* Theme toggle button */
+.theme-toggle-btn {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-light);
+  border-radius: 6px;
+  color: var(--text-primary);
+  font-size: 11px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  white-space: nowrap;
+}
+
+.theme-toggle-btn:hover {
+  background: var(--bg-elevated);
+  border-color: var(--accent);
+}
+
+.theme-toggle-btn svg {
+  flex-shrink: 0;
 }

@@ -281,3 +281,87 @@ export function calculateElementMoments(
 
   return { mx: m[0], my: m[1], mxy: m[2] };
 }
+
+/**
+ * Calculate transverse shear forces vx, vy for a DKT plate element.
+ *
+ * From equilibrium of a Kirchhoff plate:
+ *   vx = ∂mx/∂x + ∂mxy/∂y
+ *   vy = ∂mxy/∂x + ∂my/∂y
+ *
+ * We compute moments at the three Gauss points and use finite differences
+ * in the global coordinate system to approximate the derivatives.
+ */
+export function calculateElementShearForces(
+  n1: INode,
+  n2: INode,
+  n3: INode,
+  material: IMaterial,
+  thickness: number,
+  elemDisp: number[]
+): { vx: number; vy: number } {
+  const Db = getBendingConstitutiveMatrix(material, thickness);
+
+  // Evaluate moments at three Gauss points
+  const gps = GAUSS_POINTS;
+  const mGP: { mx: number; my: number; mxy: number; x: number; y: number }[] = [];
+
+  for (const gp of gps) {
+    const Bb = computeDKTBMatrix(n1, n2, n3, gp.L1, gp.L2, gp.L3);
+    const kappa = Bb.multiplyVector(elemDisp);
+    const m = Db.multiplyVector(kappa);
+
+    // Physical coordinates of the Gauss point
+    const x = gp.L1 * n1.x + gp.L2 * n2.x + gp.L3 * n3.x;
+    const y = gp.L1 * n1.y + gp.L2 * n2.y + gp.L3 * n3.y;
+
+    mGP.push({ mx: m[0], my: m[1], mxy: m[2], x, y });
+  }
+
+  // Fit a linear field to each moment component: m = a + b*x + c*y
+  // Using least squares with 3 points (exact fit for linear function)
+  function fitLinear(vals: number[], coords: { x: number; y: number }[]): { a: number; b: number; c: number } {
+    const n = coords.length;
+    let sx = 0, sy = 0, sxx = 0, syy = 0, sxy = 0;
+    let sv = 0, svx = 0, svy = 0;
+    for (let i = 0; i < n; i++) {
+      const { x, y } = coords[i];
+      sx += x; sy += y; sxx += x * x; syy += y * y; sxy += x * y;
+      sv += vals[i]; svx += vals[i] * x; svy += vals[i] * y;
+    }
+    // Solve 3x3 system: [n, sx, sy; sx, sxx, sxy; sy, sxy, syy] * [a;b;c] = [sv;svx;svy]
+    const A = [
+      [n, sx, sy],
+      [sx, sxx, sxy],
+      [sy, sxy, syy],
+    ];
+    const rhs = [sv, svx, svy];
+    // Cramer's rule for 3x3
+    const det = A[0][0] * (A[1][1] * A[2][2] - A[1][2] * A[2][1])
+              - A[0][1] * (A[1][0] * A[2][2] - A[1][2] * A[2][0])
+              + A[0][2] * (A[1][0] * A[2][1] - A[1][1] * A[2][0]);
+    if (Math.abs(det) < 1e-30) return { a: 0, b: 0, c: 0 };
+    const detA = rhs[0] * (A[1][1] * A[2][2] - A[1][2] * A[2][1])
+               - A[0][1] * (rhs[1] * A[2][2] - A[1][2] * rhs[2])
+               + A[0][2] * (rhs[1] * A[2][1] - A[1][1] * rhs[2]);
+    const detB = A[0][0] * (rhs[1] * A[2][2] - A[1][2] * rhs[2])
+               - rhs[0] * (A[1][0] * A[2][2] - A[1][2] * A[2][0])
+               + A[0][2] * (A[1][0] * rhs[2] - rhs[1] * A[2][0]);
+    const detC = A[0][0] * (A[1][1] * rhs[2] - rhs[1] * A[2][1])
+               - A[0][1] * (A[1][0] * rhs[2] - rhs[1] * A[2][0])
+               + rhs[0] * (A[1][0] * A[2][1] - A[1][1] * A[2][0]);
+    return { a: detA / det, b: detB / det, c: detC / det };
+  }
+
+  const coords = mGP.map(p => ({ x: p.x, y: p.y }));
+  const mxFit = fitLinear(mGP.map(p => p.mx), coords);
+  const myFit = fitLinear(mGP.map(p => p.my), coords);
+  const mxyFit = fitLinear(mGP.map(p => p.mxy), coords);
+
+  // vx = ∂mx/∂x + ∂mxy/∂y = mxFit.b + mxyFit.c
+  // vy = ∂mxy/∂x + ∂my/∂y = mxyFit.b + myFit.c
+  const vx = mxFit.b + mxyFit.c;
+  const vy = mxyFit.b + myFit.c;
+
+  return { vx, vy };
+}

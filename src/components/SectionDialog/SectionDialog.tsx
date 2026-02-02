@@ -1,7 +1,79 @@
-import { useState } from 'react';
+import { useState, useMemo } from 'react';
 import { IBeamSection } from '../../core/fem/types';
+import { STEEL_SECTION_SERIES, ISteelProfile } from '../../core/data/SteelSections';
 import { SectionPreview } from './SectionPreview';
 import './SectionDialog.css';
+
+type CustomSectionType = 'I-section' | 'Rectangular' | 'Circular' | 'RHS' | 'CHS';
+
+/** Compute section properties from custom dimensions (all inputs in mm, output in m) */
+function computeCustomSection(
+  type: CustomSectionType,
+  dims: { h: number; b: number; tw: number; tf: number; D: number; t: number }
+): IBeamSection | null {
+  const { h, b, tw, tf, D, t } = dims;
+  switch (type) {
+    case 'I-section': {
+      if (h <= 0 || b <= 0 || tw <= 0 || tf <= 0) return null;
+      const hm = h / 1000, bm = b / 1000, twm = tw / 1000, tfm = tf / 1000;
+      const hw = hm - 2 * tfm;
+      if (hw <= 0) return null;
+      const A = 2 * bm * tfm + hw * twm;
+      const Iy = (bm * hm ** 3 - (bm - twm) * hw ** 3) / 12;
+      const Iz = (2 * tfm * bm ** 3 + hw * twm ** 3) / 12;
+      const Wy = 2 * Iy / hm;
+      const Wz = 2 * Iz / bm;
+      const Wply = bm * tfm * (hm - tfm) + twm * hw ** 2 / 4;
+      const Wplz = 2 * tfm * bm ** 2 / 4 + hw * twm ** 2 / 4;
+      return { A, I: Iy, h: hm, Iy, Iz, Wy, Wz, Wply, Wplz };
+    }
+    case 'Rectangular': {
+      if (h <= 0 || b <= 0) return null;
+      const hm = h / 1000, bm = b / 1000;
+      const A = bm * hm;
+      const Iy = (bm * hm ** 3) / 12;
+      const Iz = (hm * bm ** 3) / 12;
+      const Wy = bm * hm ** 2 / 6;
+      const Wz = hm * bm ** 2 / 6;
+      const Wply = bm * hm ** 2 / 4;
+      const Wplz = hm * bm ** 2 / 4;
+      return { A, I: Iy, h: hm, Iy, Iz, Wy, Wz, Wply, Wplz };
+    }
+    case 'Circular': {
+      if (D <= 0) return null;
+      const r = D / 2000; // radius in m
+      const A = Math.PI * r ** 2;
+      const Iy = Math.PI * r ** 4 / 4;
+      const Wy = Math.PI * r ** 3 / 4;
+      const Wply = (4 / 3) * r ** 3;
+      return { A, I: Iy, h: D / 1000, Iy, Iz: Iy, Wy, Wz: Wy, Wply, Wplz: Wply };
+    }
+    case 'RHS': {
+      if (h <= 0 || b <= 0 || t <= 0) return null;
+      const hm = h / 1000, bm = b / 1000, tm = t / 1000;
+      if (hm <= 2 * tm || bm <= 2 * tm) return null;
+      const A = hm * bm - (hm - 2 * tm) * (bm - 2 * tm);
+      const Iy = (bm * hm ** 3 - (bm - 2 * tm) * (hm - 2 * tm) ** 3) / 12;
+      const Iz = (hm * bm ** 3 - (hm - 2 * tm) * (bm - 2 * tm) ** 3) / 12;
+      const Wy = 2 * Iy / hm;
+      const Wz = 2 * Iz / bm;
+      return { A, I: Iy, h: hm, Iy, Iz, Wy, Wz };
+    }
+    case 'CHS': {
+      if (D <= 0 || t <= 0) return null;
+      const ro = D / 2000;
+      const ri = (D / 2 - t) / 1000;
+      if (ri <= 0) return null;
+      const A = Math.PI * (ro ** 2 - ri ** 2);
+      const Iy = Math.PI * (ro ** 4 - ri ** 4) / 4;
+      const Wy = Iy / ro;
+      const Wply = (4 / 3) * (ro ** 3 - ri ** 3);
+      return { A, I: Iy, h: D / 1000, Iy, Iz: Iy, Wy, Wz: Wy, Wply, Wplz: Wply };
+    }
+    default:
+      return null;
+  }
+}
 
 type MaterialCategory = 'steel' | 'wood' | 'concrete' | 'composite' | 'other';
 
@@ -12,7 +84,11 @@ interface ProfileEntry {
   tf?: number;      // flange thickness in mm
   tw?: number;      // web thickness in mm
   weight?: number;  // kg/m
-  Wel?: number;     // elastic section modulus m³
+  Wel?: number;     // elastic section modulus strong axis m³ (legacy alias for Wy)
+  Iz?: number;      // second moment of area, weak axis (m⁴)
+  Wz?: number;      // elastic section modulus, weak axis (m³)
+  Wply?: number;    // plastic section modulus, strong axis (m³)
+  Wplz?: number;    // plastic section modulus, weak axis (m³)
   shapeType?: 'I' | 'rectangular' | 'hollow';
 }
 
@@ -27,93 +103,82 @@ type MaterialCatalog = Record<string, ProfileGroup>;
 function rect(bMm: number, hMm: number): IBeamSection {
   const b = bMm / 1000;
   const h = hMm / 1000;
-  return { A: b * h, I: (b * h * h * h) / 12, h };
+  const Iy = (b * h * h * h) / 12;
+  const Iz = (h * b * b * b) / 12;
+  return {
+    A: b * h,
+    I: Iy,
+    h,
+    Iy,
+    Iz,
+    Wy: b * h * h / 6,
+    Wz: h * b * b / 6,
+    Wply: b * h * h / 4,
+    Wplz: h * b * b / 4,
+  };
 }
 
-// ── Steel profiles ──────────────────────────────────────────────────
-const STEEL_CATALOG: MaterialCatalog = {
-  ipe: {
-    label: 'IPE',
-    profiles: [
-      { name: 'IPE 100', section: { A: 10.3e-4, I: 171e-8, h: 0.100 }, b: 55, tf: 5.7, tw: 4.1, weight: 8.1, Wel: 34.2e-6, shapeType: 'I' },
-      { name: 'IPE 120', section: { A: 13.2e-4, I: 318e-8, h: 0.120 }, b: 64, tf: 6.3, tw: 4.4, weight: 10.4, Wel: 53.0e-6, shapeType: 'I' },
-      { name: 'IPE 140', section: { A: 16.4e-4, I: 541e-8, h: 0.140 }, b: 73, tf: 6.9, tw: 4.7, weight: 12.9, Wel: 77.3e-6, shapeType: 'I' },
-      { name: 'IPE 160', section: { A: 20.1e-4, I: 869e-8, h: 0.160 }, b: 82, tf: 7.4, tw: 5.0, weight: 15.8, Wel: 109e-6, shapeType: 'I' },
-      { name: 'IPE 180', section: { A: 23.9e-4, I: 1320e-8, h: 0.180 }, b: 91, tf: 8.0, tw: 5.3, weight: 18.8, Wel: 146e-6, shapeType: 'I' },
-      { name: 'IPE 200', section: { A: 28.5e-4, I: 1940e-8, h: 0.200 }, b: 100, tf: 8.5, tw: 5.6, weight: 22.4, Wel: 194e-6, shapeType: 'I' },
-      { name: 'IPE 220', section: { A: 33.4e-4, I: 2770e-8, h: 0.220 }, b: 110, tf: 9.2, tw: 5.9, weight: 26.2, Wel: 252e-6, shapeType: 'I' },
-      { name: 'IPE 240', section: { A: 39.1e-4, I: 3890e-8, h: 0.240 }, b: 120, tf: 9.8, tw: 6.2, weight: 30.7, Wel: 324e-6, shapeType: 'I' },
-      { name: 'IPE 270', section: { A: 45.9e-4, I: 5790e-8, h: 0.270 }, b: 135, tf: 10.2, tw: 6.6, weight: 36.1, Wel: 429e-6, shapeType: 'I' },
-      { name: 'IPE 300', section: { A: 53.8e-4, I: 8360e-8, h: 0.300 }, b: 150, tf: 10.7, tw: 7.1, weight: 42.2, Wel: 557e-6, shapeType: 'I' },
-      { name: 'IPE 330', section: { A: 62.6e-4, I: 11770e-8, h: 0.330 }, b: 160, tf: 11.5, tw: 7.5, weight: 49.1, Wel: 713e-6, shapeType: 'I' },
-      { name: 'IPE 360', section: { A: 72.7e-4, I: 16270e-8, h: 0.360 }, b: 170, tf: 12.7, tw: 8.0, weight: 57.1, Wel: 904e-6, shapeType: 'I' },
-      { name: 'IPE 400', section: { A: 84.5e-4, I: 23130e-8, h: 0.400 }, b: 180, tf: 13.5, tw: 8.6, weight: 66.3, Wel: 1160e-6, shapeType: 'I' },
-      { name: 'IPE 450', section: { A: 98.8e-4, I: 33740e-8, h: 0.450 }, b: 190, tf: 14.6, tw: 9.4, weight: 77.6, Wel: 1500e-6, shapeType: 'I' },
-      { name: 'IPE 500', section: { A: 115.5e-4, I: 48200e-8, h: 0.500 }, b: 200, tf: 16.0, tw: 10.2, weight: 90.7, Wel: 1930e-6, shapeType: 'I' },
-      { name: 'IPE 550', section: { A: 134.4e-4, I: 67120e-8, h: 0.550 }, b: 210, tf: 17.2, tw: 11.1, weight: 106, Wel: 2440e-6, shapeType: 'I' },
-      { name: 'IPE 600', section: { A: 156.0e-4, I: 92080e-8, h: 0.600 }, b: 220, tf: 19.0, tw: 12.0, weight: 122, Wel: 3070e-6, shapeType: 'I' },
-    ],
-  },
-  hea: {
-    label: 'HEA',
-    profiles: [
-      { name: 'HEA 100', section: { A: 21.2e-4, I: 349e-8, h: 0.096 }, b: 100, tf: 8.0, tw: 5.0, weight: 16.7, shapeType: 'I' },
-      { name: 'HEA 120', section: { A: 25.3e-4, I: 606e-8, h: 0.114 }, b: 120, tf: 8.0, tw: 5.0, weight: 19.9, shapeType: 'I' },
-      { name: 'HEA 140', section: { A: 31.4e-4, I: 1030e-8, h: 0.133 }, b: 140, tf: 8.5, tw: 5.5, weight: 24.7, shapeType: 'I' },
-      { name: 'HEA 160', section: { A: 38.8e-4, I: 1670e-8, h: 0.152 }, b: 160, tf: 9.0, tw: 6.0, weight: 30.4, shapeType: 'I' },
-      { name: 'HEA 180', section: { A: 45.3e-4, I: 2510e-8, h: 0.171 }, b: 180, tf: 9.5, tw: 6.0, weight: 35.5, shapeType: 'I' },
-      { name: 'HEA 200', section: { A: 53.8e-4, I: 3690e-8, h: 0.190 }, b: 200, tf: 10.0, tw: 6.5, weight: 42.3, shapeType: 'I' },
-      { name: 'HEA 220', section: { A: 64.3e-4, I: 5410e-8, h: 0.210 }, b: 220, tf: 11.0, tw: 7.0, weight: 50.5, shapeType: 'I' },
-      { name: 'HEA 240', section: { A: 76.8e-4, I: 7760e-8, h: 0.230 }, b: 240, tf: 12.0, tw: 7.5, weight: 60.3, shapeType: 'I' },
-      { name: 'HEA 260', section: { A: 86.8e-4, I: 10450e-8, h: 0.250 }, b: 260, tf: 12.5, tw: 7.5, weight: 68.2, shapeType: 'I' },
-      { name: 'HEA 280', section: { A: 97.3e-4, I: 13670e-8, h: 0.270 }, b: 280, tf: 13.0, tw: 8.0, weight: 76.4, shapeType: 'I' },
-      { name: 'HEA 300', section: { A: 112.5e-4, I: 18260e-8, h: 0.290 }, b: 300, tf: 14.0, tw: 8.5, weight: 88.3, shapeType: 'I' },
-      { name: 'HEA 320', section: { A: 124.4e-4, I: 22930e-8, h: 0.310 }, b: 300, tf: 15.5, tw: 9.0, weight: 97.6, shapeType: 'I' },
-      { name: 'HEA 340', section: { A: 133.5e-4, I: 27690e-8, h: 0.330 }, b: 300, tf: 16.5, tw: 9.5, weight: 105, shapeType: 'I' },
-      { name: 'HEA 360', section: { A: 142.8e-4, I: 33090e-8, h: 0.350 }, b: 300, tf: 17.5, tw: 10.0, weight: 112, shapeType: 'I' },
-      { name: 'HEA 400', section: { A: 159.0e-4, I: 45070e-8, h: 0.390 }, b: 300, tf: 19.0, tw: 11.0, weight: 125, shapeType: 'I' },
-    ],
-  },
-  heb: {
-    label: 'HEB',
-    profiles: [
-      { name: 'HEB 100', section: { A: 26.0e-4, I: 450e-8, h: 0.100 }, b: 100, tf: 10.0, tw: 6.0, weight: 20.4, shapeType: 'I' },
-      { name: 'HEB 120', section: { A: 34.0e-4, I: 864e-8, h: 0.120 }, b: 120, tf: 11.0, tw: 6.5, weight: 26.7, shapeType: 'I' },
-      { name: 'HEB 140', section: { A: 43.0e-4, I: 1510e-8, h: 0.140 }, b: 140, tf: 12.0, tw: 7.0, weight: 33.7, shapeType: 'I' },
-      { name: 'HEB 160', section: { A: 54.3e-4, I: 2490e-8, h: 0.160 }, b: 160, tf: 13.0, tw: 8.0, weight: 42.6, shapeType: 'I' },
-      { name: 'HEB 180', section: { A: 65.3e-4, I: 3830e-8, h: 0.180 }, b: 180, tf: 14.0, tw: 8.5, weight: 51.2, shapeType: 'I' },
-      { name: 'HEB 200', section: { A: 78.1e-4, I: 5700e-8, h: 0.200 }, b: 200, tf: 15.0, tw: 9.0, weight: 61.3, shapeType: 'I' },
-      { name: 'HEB 220', section: { A: 91.0e-4, I: 8090e-8, h: 0.220 }, b: 220, tf: 16.0, tw: 9.5, weight: 71.5, shapeType: 'I' },
-      { name: 'HEB 240', section: { A: 106.0e-4, I: 11260e-8, h: 0.240 }, b: 240, tf: 17.0, tw: 10.0, weight: 83.2, shapeType: 'I' },
-      { name: 'HEB 260', section: { A: 118.4e-4, I: 14920e-8, h: 0.260 }, b: 260, tf: 17.5, tw: 10.0, weight: 93.0, shapeType: 'I' },
-      { name: 'HEB 280', section: { A: 131.4e-4, I: 19270e-8, h: 0.280 }, b: 280, tf: 18.0, tw: 10.5, weight: 103, shapeType: 'I' },
-      { name: 'HEB 300', section: { A: 149.1e-4, I: 25170e-8, h: 0.300 }, b: 300, tf: 19.0, tw: 11.0, weight: 117, shapeType: 'I' },
-      { name: 'HEB 320', section: { A: 161.3e-4, I: 30820e-8, h: 0.320 }, b: 300, tf: 20.5, tw: 11.5, weight: 127, shapeType: 'I' },
-      { name: 'HEB 340', section: { A: 170.9e-4, I: 36660e-8, h: 0.340 }, b: 300, tf: 21.5, tw: 12.0, weight: 134, shapeType: 'I' },
-      { name: 'HEB 360', section: { A: 180.6e-4, I: 43190e-8, h: 0.360 }, b: 300, tf: 22.5, tw: 12.5, weight: 142, shapeType: 'I' },
-      { name: 'HEB 400', section: { A: 197.8e-4, I: 57680e-8, h: 0.400 }, b: 300, tf: 24.0, tw: 13.5, weight: 155, shapeType: 'I' },
-    ],
-  },
-  koker: {
-    label: 'Koker',
-    profiles: [
-      { name: 'SHS 80x80x4', section: { A: 11.7e-4, I: 115e-8, h: 0.080 }, b: 80, tw: 4, shapeType: 'hollow' },
-      { name: 'SHS 100x100x5', section: { A: 18.7e-4, I: 293e-8, h: 0.100 }, b: 100, tw: 5, shapeType: 'hollow' },
-      { name: 'SHS 120x120x5', section: { A: 22.7e-4, I: 518e-8, h: 0.120 }, b: 120, tw: 5, shapeType: 'hollow' },
-      { name: 'SHS 150x150x6', section: { A: 33.4e-4, I: 1200e-8, h: 0.150 }, b: 150, tw: 6, shapeType: 'hollow' },
-      { name: 'SHS 200x200x8', section: { A: 58.8e-4, I: 3720e-8, h: 0.200 }, b: 200, tw: 8, shapeType: 'hollow' },
-      { name: 'SHS 250x250x10', section: { A: 91.0e-4, I: 9060e-8, h: 0.250 }, b: 250, tw: 10, shapeType: 'hollow' },
-      { name: 'SHS 300x300x10', section: { A: 110.0e-4, I: 15700e-8, h: 0.300 }, b: 300, tw: 10, shapeType: 'hollow' },
-      { name: 'RHS 100x50x4', section: { A: 11.0e-4, I: 169e-8, h: 0.100 }, b: 50, tw: 4, shapeType: 'hollow' },
-      { name: 'RHS 120x60x5', section: { A: 16.7e-4, I: 361e-8, h: 0.120 }, b: 60, tw: 5, shapeType: 'hollow' },
-      { name: 'RHS 150x100x6', section: { A: 28.1e-4, I: 1040e-8, h: 0.150 }, b: 100, tw: 6, shapeType: 'hollow' },
-      { name: 'RHS 200x100x8', section: { A: 43.2e-4, I: 2590e-8, h: 0.200 }, b: 100, tw: 8, shapeType: 'hollow' },
-      { name: 'RHS 250x150x8', section: { A: 58.4e-4, I: 6460e-8, h: 0.250 }, b: 150, tw: 8, shapeType: 'hollow' },
-      { name: 'RHS 300x200x10', section: { A: 91.0e-4, I: 14400e-8, h: 0.300 }, b: 200, tw: 10, shapeType: 'hollow' },
-    ],
-  },
-  custom: { label: 'Handmatig', profiles: [] },
-};
+// ── Convert ISteelProfile to ProfileEntry (catalog units -> SI units) ──
+function steelProfileToEntry(p: ISteelProfile): ProfileEntry {
+  const series = p.series;
+  const isHollow = series === 'RHS' || series === 'CHS';
+  const isChannel = series === 'UNP';
+  const shapeType: 'I' | 'hollow' | 'rectangular' = isHollow ? 'hollow' : (isChannel ? 'I' : 'I');
+
+  // Convert catalog units (cm/mm) to SI (m)
+  const Iy_m4 = p.Iy * 1e-8;   // cm⁴ -> m⁴
+  const Iz_m4 = p.Iz * 1e-8;
+  const Wy_m3 = p.Wy * 1e-6;   // cm³ -> m³
+  const Wz_m3 = p.Wz * 1e-6;
+  const Wply_m3 = p.Wpl_y * 1e-6;
+  const Wplz_m3 = p.Wpl_z * 1e-6;
+  const It_m4 = p.It * 1e-8;
+  const Iw_m6 = p.Iw * 1e-12;  // cm⁶ -> m⁶
+
+  return {
+    name: p.name,
+    section: {
+      A: p.A * 1e-4,       // cm² -> m²
+      I: Iy_m4,
+      h: p.h / 1000,       // mm -> m
+      b: p.b / 1000,       // mm -> m
+      tw: p.tw / 1000,     // mm -> m
+      tf: p.tf / 1000,     // mm -> m
+      Iy: Iy_m4,
+      Iz: Iz_m4,
+      Wy: Wy_m3,
+      Wz: Wz_m3,
+      Wply: Wply_m3,
+      Wplz: Wplz_m3,
+      It: It_m4,
+      Iw: Iw_m6,
+    },
+    b: p.b,
+    tf: p.tf,
+    tw: p.tw,
+    weight: p.mass,
+    Wel: Wy_m3,
+    Iz: Iz_m4,
+    Wz: Wz_m3,
+    Wply: Wply_m3,
+    Wplz: Wplz_m3,
+    shapeType,
+  };
+}
+
+// ── Steel profiles (generated from SteelSections database) ──────────
+const STEEL_CATALOG: MaterialCatalog = (() => {
+  const catalog: MaterialCatalog = {};
+  for (const [seriesKey, profiles] of Object.entries(STEEL_SECTION_SERIES)) {
+    const key = seriesKey.toLowerCase();
+    catalog[key] = {
+      label: seriesKey,
+      profiles: profiles.map(steelProfileToEntry),
+    };
+  }
+  catalog['custom'] = { label: 'Custom', profiles: [] };
+  return catalog;
+})();
 
 // ── Wood profiles (rectangular) ─────────────────────────────────────
 const WOOD_CATALOG: MaterialCatalog = {
@@ -165,7 +230,7 @@ const WOOD_CATALOG: MaterialCatalog = {
       { name: '100x400', section: rect(100, 400), b: 100, shapeType: 'rectangular' },
     ],
   },
-  custom: { label: 'Handmatig', profiles: [] },
+  custom: { label: 'Custom', profiles: [] },
 };
 
 // ── Concrete profiles (rectangular) ─────────────────────────────────
@@ -206,26 +271,26 @@ const CONCRETE_CATALOG: MaterialCatalog = {
       { name: '400x1000', section: rect(400, 1000), b: 400, shapeType: 'rectangular' },
     ],
   },
-  custom: { label: 'Handmatig', profiles: [] },
+  custom: { label: 'Custom', profiles: [] },
 };
 
 // ── Composite / built-up sections ───────────────────────────────────
 const COMPOSITE_CATALOG: MaterialCatalog = {
-  custom: { label: 'Handmatig', profiles: [] },
+  custom: { label: 'Custom', profiles: [] },
 };
 
 // ── Other ───────────────────────────────────────────────────────────
 const OTHER_CATALOG: MaterialCatalog = {
-  custom: { label: 'Handmatig', profiles: [] },
+  custom: { label: 'Custom', profiles: [] },
 };
 
 // ── Material categories ─────────────────────────────────────────────
 const MATERIALS: { key: MaterialCategory; label: string; catalog: MaterialCatalog }[] = [
-  { key: 'steel', label: 'Staal', catalog: STEEL_CATALOG },
-  { key: 'wood', label: 'Hout', catalog: WOOD_CATALOG },
-  { key: 'concrete', label: 'Beton', catalog: CONCRETE_CATALOG },
-  { key: 'composite', label: 'Samengesteld', catalog: COMPOSITE_CATALOG },
-  { key: 'other', label: 'Overig', catalog: OTHER_CATALOG },
+  { key: 'steel', label: 'Steel', catalog: STEEL_CATALOG },
+  { key: 'wood', label: 'Timber', catalog: WOOD_CATALOG },
+  { key: 'concrete', label: 'Concrete', catalog: CONCRETE_CATALOG },
+  { key: 'composite', label: 'Composite', catalog: COMPOSITE_CATALOG },
+  { key: 'other', label: 'Other', catalog: OTHER_CATALOG },
 ];
 
 // ── Component ───────────────────────────────────────────────────────
@@ -249,8 +314,44 @@ const WOOD_GRADES = [
   { name: 'GL32h', fb: 32 },
 ];
 
+// Concrete quality grades (Eurocode 2)
+const CONCRETE_GRADES = [
+  { name: 'C12/15', fck: 12 },
+  { name: 'C16/20', fck: 16 },
+  { name: 'C20/25', fck: 20 },
+  { name: 'C25/30', fck: 25 },
+  { name: 'C30/37', fck: 30 },
+  { name: 'C35/45', fck: 35 },
+  { name: 'C40/50', fck: 40 },
+  { name: 'C45/55', fck: 45 },
+  { name: 'C50/60', fck: 50 },
+];
+
+// Reinforcement steel grades
+const REBAR_GRADES = [
+  { name: 'B500A', fyk: 500 },
+  { name: 'B500B', fyk: 500 },
+  { name: 'B500C', fyk: 500 },
+];
+
+// Standard stirrup diameters (mm)
+const STIRRUP_DIAMETERS = [6, 8, 10, 12];
+
+export interface IConcreteProperties {
+  concreteGrade: string;
+  fck: number;
+  rebarGrade: string;
+  fyk: number;
+  asBottom: number;       // mm²
+  asTop: number;          // mm²
+  cover: number;          // mm
+  stirrupDiameter: number; // mm
+  stirrupSpacing: number;  // mm
+  stirrupLegs: number;
+}
+
 interface SectionDialogProps {
-  onSelect: (section: IBeamSection, profileName: string) => void;
+  onSelect: (section: IBeamSection, profileName: string, concreteProps?: IConcreteProperties) => void;
   onCancel: () => void;
 }
 
@@ -263,6 +364,34 @@ export function SectionDialog({ onSelect, onCancel }: SectionDialogProps) {
   const [customH, setCustomH] = useState('0.200');
   const [steelGrade, setSteelGrade] = useState('S235');
   const [woodGrade, setWoodGrade] = useState('C24');
+  const [concreteGrade, setConcreteGrade] = useState('C30/37');
+  const [rebarGrade, setRebarGrade] = useState('B500B');
+  const [asBottom, setAsBottom] = useState('804');       // mm² (e.g. 4Ø16)
+  const [asTop, setAsTop] = useState('402');             // mm² (e.g. 2Ø16)
+  const [cover, setCover] = useState('30');              // mm
+  const [stirrupDiameter, setStirrupDiameter] = useState(8);
+  const [stirrupSpacing, setStirrupSpacing] = useState('200');
+  const [stirrupLegs, setStirrupLegs] = useState(2);
+
+  // Custom section editor state
+  const [customSectionType, setCustomSectionType] = useState<CustomSectionType>('I-section');
+  const [csH, setCsH] = useState('200');
+  const [csB, setCsB] = useState('100');
+  const [csTw, setCsTw] = useState('5.6');
+  const [csTf, setCsTf] = useState('8.5');
+  const [csD, setCsD] = useState('200');
+  const [csT, setCsT] = useState('8');
+
+  const customSectionResult = useMemo(() => {
+    return computeCustomSection(customSectionType, {
+      h: parseFloat(csH) || 0,
+      b: parseFloat(csB) || 0,
+      tw: parseFloat(csTw) || 0,
+      tf: parseFloat(csTf) || 0,
+      D: parseFloat(csD) || 0,
+      t: parseFloat(csT) || 0,
+    });
+  }, [customSectionType, csH, csB, csTw, csTf, csD, csT]);
 
   const currentMat = MATERIALS.find(m => m.key === material)!;
   const catalog = currentMat.catalog;
@@ -293,13 +422,43 @@ export function SectionDialog({ onSelect, onCancel }: SectionDialogProps) {
     }
   };
 
+  const buildConcreteProps = (): IConcreteProperties | undefined => {
+    if (material !== 'concrete') return undefined;
+    const gradeInfo = CONCRETE_GRADES.find(g => g.name === concreteGrade);
+    const rebarInfo = REBAR_GRADES.find(g => g.name === rebarGrade);
+    return {
+      concreteGrade,
+      fck: gradeInfo?.fck ?? 30,
+      rebarGrade,
+      fyk: rebarInfo?.fyk ?? 500,
+      asBottom: parseFloat(asBottom) || 0,
+      asTop: parseFloat(asTop) || 0,
+      cover: parseFloat(cover) || 30,
+      stirrupDiameter,
+      stirrupSpacing: parseFloat(stirrupSpacing) || 200,
+      stirrupLegs,
+    };
+  };
+
   const handleConfirm = () => {
     if (isCustom) {
+      // Check if user used the parametric custom editor
+      if (customSectionResult) {
+        let label = `Custom ${customSectionType}`;
+        if (customSectionType === 'I-section') label = `Custom I ${csH}x${csB}`;
+        else if (customSectionType === 'Rectangular') label = `Custom ${csH}x${csB}`;
+        else if (customSectionType === 'Circular') label = `Custom CIR D${csD}`;
+        else if (customSectionType === 'RHS') label = `Custom RHS ${csH}x${csB}x${csT}`;
+        else if (customSectionType === 'CHS') label = `Custom CHS D${csD}x${csT}`;
+        onSelect(customSectionResult, label, buildConcreteProps());
+        return;
+      }
+      // Fallback to raw A/I/h input
       const A = parseFloat(customA);
       const I = parseFloat(customI);
       const h = parseFloat(customH);
       if (isNaN(A) || isNaN(I) || isNaN(h) || A <= 0 || I <= 0 || h <= 0) return;
-      onSelect({ A, I, h }, 'Custom');
+      onSelect({ A, I, h }, 'Custom', buildConcreteProps());
       return;
     }
 
@@ -308,7 +467,8 @@ export function SectionDialog({ onSelect, onCancel }: SectionDialogProps) {
       let label = profile.name;
       if (material === 'steel') label = `${profile.name} (${steelGrade})`;
       if (material === 'wood') label = `${profile.name} (${woodGrade})`;
-      onSelect(profile.section, label);
+      if (material === 'concrete') label = `${profile.name} (${concreteGrade})`;
+      onSelect(profile.section, label, buildConcreteProps());
     }
   };
 
@@ -316,7 +476,7 @@ export function SectionDialog({ onSelect, onCancel }: SectionDialogProps) {
     <div className="section-dialog-overlay" onClick={onCancel}>
       <div className="section-dialog" onClick={e => e.stopPropagation()}>
         <div className="section-dialog-header">
-          Doorsnede Profiel
+          Section Profile
         </div>
 
         <div className="section-dialog-body">
@@ -351,7 +511,7 @@ export function SectionDialog({ onSelect, onCancel }: SectionDialogProps) {
           {/* Quality grade selector */}
           {material === 'steel' && (
             <div className="section-grade-row">
-              <span className="section-grade-label">Staalsoort:</span>
+              <span className="section-grade-label">Steel grade:</span>
               <select
                 className="section-grade-select"
                 value={steelGrade}
@@ -365,7 +525,7 @@ export function SectionDialog({ onSelect, onCancel }: SectionDialogProps) {
           )}
           {material === 'wood' && (
             <div className="section-grade-row">
-              <span className="section-grade-label">Houtklasse:</span>
+              <span className="section-grade-label">Timber class:</span>
               <select
                 className="section-grade-select"
                 value={woodGrade}
@@ -375,6 +535,118 @@ export function SectionDialog({ onSelect, onCancel }: SectionDialogProps) {
                   <option key={g.name} value={g.name}>{g.name} (fb={g.fb} MPa)</option>
                 ))}
               </select>
+            </div>
+          )}
+
+          {material === 'concrete' && (
+            <div className="section-concrete-fields">
+              {/* Concrete quality */}
+              <div className="section-grade-row">
+                <span className="section-grade-label">Concrete grade:</span>
+                <select
+                  className="section-grade-select"
+                  value={concreteGrade}
+                  onChange={e => setConcreteGrade(e.target.value)}
+                >
+                  {CONCRETE_GRADES.map(g => (
+                    <option key={g.name} value={g.name}>{g.name} (fck={g.fck} MPa)</option>
+                  ))}
+                </select>
+              </div>
+
+              {/* Reinforcement */}
+              <div className="section-concrete-group">
+                <div className="section-concrete-group-title">Reinforcement</div>
+                <div className="section-grade-row">
+                  <span className="section-grade-label">Steel grade:</span>
+                  <select
+                    className="section-grade-select"
+                    value={rebarGrade}
+                    onChange={e => setRebarGrade(e.target.value)}
+                  >
+                    {REBAR_GRADES.map(g => (
+                      <option key={g.name} value={g.name}>{g.name} (fyk={g.fyk} MPa)</option>
+                    ))}
+                  </select>
+                </div>
+                <div className="section-grade-row">
+                  <span className="section-grade-label">As,bottom (mm²):</span>
+                  <input
+                    className="section-grade-input"
+                    type="number"
+                    min="0"
+                    step="1"
+                    value={asBottom}
+                    onChange={e => setAsBottom(e.target.value)}
+                    placeholder="e.g. 804 (4Ø16)"
+                  />
+                </div>
+                <div className="section-grade-row">
+                  <span className="section-grade-label">As,top (mm²):</span>
+                  <input
+                    className="section-grade-input"
+                    type="number"
+                    min="0"
+                    step="1"
+                    value={asTop}
+                    onChange={e => setAsTop(e.target.value)}
+                    placeholder="e.g. 402 (2Ø16)"
+                  />
+                </div>
+                <div className="section-grade-row">
+                  <span className="section-grade-label">Cover (mm):</span>
+                  <input
+                    className="section-grade-input"
+                    type="number"
+                    min="10"
+                    max="100"
+                    step="5"
+                    value={cover}
+                    onChange={e => setCover(e.target.value)}
+                  />
+                </div>
+              </div>
+
+              {/* Stirrups */}
+              <div className="section-concrete-group">
+                <div className="section-concrete-group-title">Stirrups</div>
+                <div className="section-grade-row">
+                  <span className="section-grade-label">Diameter:</span>
+                  <select
+                    className="section-grade-select"
+                    value={stirrupDiameter}
+                    onChange={e => setStirrupDiameter(Number(e.target.value))}
+                  >
+                    {STIRRUP_DIAMETERS.map(d => (
+                      <option key={d} value={d}>&Oslash;{d}</option>
+                    ))}
+                  </select>
+                </div>
+                <div className="section-grade-row">
+                  <span className="section-grade-label">Spacing (mm):</span>
+                  <input
+                    className="section-grade-input"
+                    type="number"
+                    min="50"
+                    max="600"
+                    step="25"
+                    value={stirrupSpacing}
+                    onChange={e => setStirrupSpacing(e.target.value)}
+                  />
+                </div>
+                <div className="section-grade-row">
+                  <span className="section-grade-label">Legs:</span>
+                  <select
+                    className="section-grade-select"
+                    value={stirrupLegs}
+                    onChange={e => setStirrupLegs(Number(e.target.value))}
+                  >
+                    <option value={2}>2</option>
+                    <option value={3}>3</option>
+                    <option value={4}>4</option>
+                  </select>
+                </div>
+              </div>
             </div>
           )}
 
@@ -398,6 +670,56 @@ export function SectionDialog({ onSelect, onCancel }: SectionDialogProps) {
                 </div>
               ) : (
                 <div className="section-custom-form">
+                  {/* Parametric section type selector */}
+                  <label>
+                    <span>Type</span>
+                    <select
+                      className="section-grade-select"
+                      value={customSectionType}
+                      onChange={e => setCustomSectionType(e.target.value as CustomSectionType)}
+                    >
+                      <option value="I-section">I-section</option>
+                      <option value="Rectangular">Rectangular</option>
+                      <option value="Circular">Circular</option>
+                      <option value="RHS">RHS (Hollow Rect.)</option>
+                      <option value="CHS">CHS (Hollow Circ.)</option>
+                    </select>
+                  </label>
+
+                  {/* Dimension inputs per section type */}
+                  {(customSectionType === 'I-section') && (
+                    <>
+                      <label><span>h (mm)</span><input type="number" min="0" step="1" value={csH} onChange={e => setCsH(e.target.value)} /></label>
+                      <label><span>b (mm)</span><input type="number" min="0" step="1" value={csB} onChange={e => setCsB(e.target.value)} /></label>
+                      <label><span>tw (mm)</span><input type="number" min="0" step="0.1" value={csTw} onChange={e => setCsTw(e.target.value)} /></label>
+                      <label><span>tf (mm)</span><input type="number" min="0" step="0.1" value={csTf} onChange={e => setCsTf(e.target.value)} /></label>
+                    </>
+                  )}
+                  {(customSectionType === 'Rectangular') && (
+                    <>
+                      <label><span>h (mm)</span><input type="number" min="0" step="1" value={csH} onChange={e => setCsH(e.target.value)} /></label>
+                      <label><span>b (mm)</span><input type="number" min="0" step="1" value={csB} onChange={e => setCsB(e.target.value)} /></label>
+                    </>
+                  )}
+                  {(customSectionType === 'Circular') && (
+                    <label><span>D (mm)</span><input type="number" min="0" step="1" value={csD} onChange={e => setCsD(e.target.value)} /></label>
+                  )}
+                  {(customSectionType === 'RHS') && (
+                    <>
+                      <label><span>h (mm)</span><input type="number" min="0" step="1" value={csH} onChange={e => setCsH(e.target.value)} /></label>
+                      <label><span>b (mm)</span><input type="number" min="0" step="1" value={csB} onChange={e => setCsB(e.target.value)} /></label>
+                      <label><span>t (mm)</span><input type="number" min="0" step="0.1" value={csT} onChange={e => setCsT(e.target.value)} /></label>
+                    </>
+                  )}
+                  {(customSectionType === 'CHS') && (
+                    <>
+                      <label><span>D (mm)</span><input type="number" min="0" step="1" value={csD} onChange={e => setCsD(e.target.value)} /></label>
+                      <label><span>t (mm)</span><input type="number" min="0" step="0.1" value={csT} onChange={e => setCsT(e.target.value)} /></label>
+                    </>
+                  )}
+
+                  {/* Fallback raw values */}
+                  <div className="section-custom-divider">Or enter raw values:</div>
                   <label>
                     <span>A (m&sup2;)</span>
                     <input type="text" value={customA} onChange={e => setCustomA(e.target.value)} />
@@ -414,7 +736,7 @@ export function SectionDialog({ onSelect, onCancel }: SectionDialogProps) {
               )}
             </div>
 
-            {/* Right column: preview + properties */}
+            {/* Right column: preview + properties (catalog profiles) */}
             {!isCustom && activeProfile && (
               <div className="section-right-column">
                 <div className="section-preview-area">
@@ -424,14 +746,27 @@ export function SectionDialog({ onSelect, onCancel }: SectionDialogProps) {
                     b={activeProfile.b || activeProfile.section.h * 500}
                     tf={activeProfile.tf}
                     tw={activeProfile.tw}
+                    sectionProps={{
+                      A: activeProfile.section.A,
+                      Iy: activeProfile.section.Iy ?? activeProfile.section.I,
+                      Iz: activeProfile.section.Iz,
+                      Wy: activeProfile.section.Wy,
+                      Wz: activeProfile.section.Wz,
+                    }}
                   />
                 </div>
                 <div className="section-properties">
                   <table className="section-props-table">
                     <tbody>
                       <tr><td>A</td><td>{formatSci(activeProfile.section.A)} m²</td></tr>
-                      <tr><td>I</td><td>{formatSci(activeProfile.section.I)} m⁴</td></tr>
-                      {activeProfile.Wel && <tr><td>W_el</td><td>{formatSci(activeProfile.Wel)} m³</td></tr>}
+                      <tr><td>Iy</td><td>{formatSci(activeProfile.section.Iy ?? activeProfile.section.I)} m⁴</td></tr>
+                      {activeProfile.section.Iz != null && <tr><td>Iz</td><td>{formatSci(activeProfile.section.Iz)} m⁴</td></tr>}
+                      {activeProfile.section.Wy != null && <tr><td>Wy</td><td>{formatSci(activeProfile.section.Wy)} m³</td></tr>}
+                      {activeProfile.section.Wz != null && <tr><td>Wz</td><td>{formatSci(activeProfile.section.Wz)} m³</td></tr>}
+                      {activeProfile.section.Wply != null && <tr><td>Wpl,y</td><td>{formatSci(activeProfile.section.Wply)} m³</td></tr>}
+                      {activeProfile.section.Wplz != null && <tr><td>Wpl,z</td><td>{formatSci(activeProfile.section.Wplz)} m³</td></tr>}
+                      {activeProfile.section.It != null && activeProfile.section.It > 0 && <tr><td>It</td><td>{formatSci(activeProfile.section.It)} m⁴</td></tr>}
+                      {activeProfile.section.Iw != null && activeProfile.section.Iw > 0 && <tr><td>Iw</td><td>{formatSci(activeProfile.section.Iw)} m⁶</td></tr>}
                       <tr><td>h</td><td>{(activeProfile.section.h * 1000).toFixed(0)} mm</td></tr>
                       {activeProfile.b && <tr><td>b</td><td>{activeProfile.b} mm</td></tr>}
                       {activeProfile.tf && <tr><td>t_f</td><td>{activeProfile.tf} mm</td></tr>}
@@ -439,6 +774,72 @@ export function SectionDialog({ onSelect, onCancel }: SectionDialogProps) {
                       {activeProfile.weight && <tr><td>Mass</td><td>{activeProfile.weight} kg/m</td></tr>}
                     </tbody>
                   </table>
+                </div>
+              </div>
+            )}
+
+            {/* Right column: preview + properties (custom sections) */}
+            {isCustom && (
+              <div className="section-right-column">
+                <div className="section-preview-area">
+                  {customSectionResult ? (
+                    <SectionPreview
+                      shapeType={
+                        customSectionType === 'I-section' ? 'I' :
+                        customSectionType === 'Rectangular' ? 'rectangular' :
+                        customSectionType === 'Circular' ? 'circular' :
+                        customSectionType === 'RHS' ? 'hollow' :
+                        customSectionType === 'CHS' ? 'CHS' : 'rectangular'
+                      }
+                      h={
+                        (customSectionType === 'Circular' || customSectionType === 'CHS')
+                          ? (parseFloat(csD) || 200)
+                          : (parseFloat(csH) || 200)
+                      }
+                      b={
+                        (customSectionType === 'Circular' || customSectionType === 'CHS')
+                          ? (parseFloat(csD) || 200)
+                          : (parseFloat(csB) || 100)
+                      }
+                      tf={customSectionType === 'I-section' ? (parseFloat(csTf) || 0) : undefined}
+                      tw={
+                        customSectionType === 'I-section' ? (parseFloat(csTw) || 0) :
+                        (customSectionType === 'RHS' || customSectionType === 'CHS') ? (parseFloat(csT) || 0) :
+                        undefined
+                      }
+                      sectionProps={customSectionResult ? {
+                        A: customSectionResult.A,
+                        Iy: customSectionResult.Iy,
+                        Iz: customSectionResult.Iz,
+                        Wy: customSectionResult.Wy,
+                        Wz: customSectionResult.Wz,
+                      } : undefined}
+                    />
+                  ) : (
+                    <div style={{ color: 'var(--text-muted)', fontSize: 11, textAlign: 'center', padding: 20 }}>
+                      Enter dimensions to see preview
+                    </div>
+                  )}
+                </div>
+                <div className="section-properties">
+                  {customSectionResult ? (
+                    <table className="section-props-table">
+                      <tbody>
+                        <tr><td>A</td><td>{formatSci(customSectionResult.A)} m²</td></tr>
+                        <tr><td>Iy</td><td>{formatSci(customSectionResult.Iy ?? customSectionResult.I)} m⁴</td></tr>
+                        {customSectionResult.Iz != null && <tr><td>Iz</td><td>{formatSci(customSectionResult.Iz)} m⁴</td></tr>}
+                        {customSectionResult.Wy != null && <tr><td>Wy</td><td>{formatSci(customSectionResult.Wy)} m³</td></tr>}
+                        {customSectionResult.Wz != null && <tr><td>Wz</td><td>{formatSci(customSectionResult.Wz)} m³</td></tr>}
+                        {customSectionResult.Wply != null && <tr><td>Wpl,y</td><td>{formatSci(customSectionResult.Wply)} m³</td></tr>}
+                        {customSectionResult.Wplz != null && <tr><td>Wpl,z</td><td>{formatSci(customSectionResult.Wplz)} m³</td></tr>}
+                        <tr><td>h</td><td>{(customSectionResult.h * 1000).toFixed(0)} mm</td></tr>
+                      </tbody>
+                    </table>
+                  ) : (
+                    <div style={{ color: 'var(--text-muted)', fontSize: 11, padding: 12 }}>
+                      Computed properties will appear here
+                    </div>
+                  )}
                 </div>
               </div>
             )}

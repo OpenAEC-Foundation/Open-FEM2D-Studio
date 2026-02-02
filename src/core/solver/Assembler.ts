@@ -2,13 +2,14 @@ import { Matrix } from '../math/Matrix';
 import { Mesh } from '../fem/Mesh';
 import { AnalysisType } from '../fem/types';
 import { calculateElementStiffness } from '../fem/Triangle';
+import { calculateQuadStiffness } from '../fem/Quad4';
 import { calculateDKTStiffness } from '../fem/DKT';
-import { calculateBeamGlobalStiffness, calculateDistributedLoadVector, calculatePartialDistributedLoadVector, transformLocalToGlobal, calculateBeamLength, calculateBeamAngle } from '../fem/Beam';
+import { calculateBeamGlobalStiffness, calculateDistributedLoadVector, calculatePartialDistributedLoadVector, calculateTrapezoidalLoadVector, calculatePartialTrapezoidalLoadVector, transformLocalToGlobal, calculateBeamLength, calculateBeamAngle } from '../fem/Beam';
 
 /**
  * Collect only the nodes that participate in the current analysis type.
  * For frame: nodes used by beam elements.
- * For plane_stress/plane_strain: nodes used by triangle elements.
+ * For plane_stress/plane_strain: nodes used by triangle/quad elements.
  * This prevents disconnected nodes from creating zero-stiffness DOFs (singular matrix).
  */
 function getActiveNodeIds(mesh: Mesh, analysisType: AnalysisType): Set<number> {
@@ -144,37 +145,50 @@ export function assembleGlobalStiffnessMatrix(
       }
     }
   } else {
-    // Assemble triangle elements for plane stress/strain
+    // Assemble triangle and quad elements for plane stress/strain
     for (const element of mesh.elements.values()) {
       const nodes = mesh.getElementNodes(element);
-      if (nodes.length !== 3) continue;
 
       const material = mesh.getMaterial(element.materialId);
       if (!material) continue;
 
-      const [n1, n2, n3] = nodes;
-
       try {
-        const Ke = calculateElementStiffness(
-          n1, n2, n3,
-          material,
-          element.thickness,
-          analysisType
-        );
+        if (nodes.length === 4) {
+          // 4-node quad element (8x8 stiffness)
+          const [n1, n2, n3, n4] = nodes;
+          const Ke = calculateQuadStiffness(n1, n2, n3, n4, material, element.thickness, analysisType);
 
-        // Get global DOF indices for this element
-        const dofIndices: number[] = [];
-        for (const node of nodes) {
-          const nodeIndex = nodeIdToIndex.get(node.id)!;
-          dofIndices.push(nodeIndex * 2);     // u
-          dofIndices.push(nodeIndex * 2 + 1); // v
-        }
-
-        // Assemble into global matrix
-        for (let i = 0; i < 6; i++) {
-          for (let j = 0; j < 6; j++) {
-            K.addAt(dofIndices[i], dofIndices[j], Ke.get(i, j));
+          const dofIndices: number[] = [];
+          for (const node of nodes) {
+            const nodeIndex = nodeIdToIndex.get(node.id)!;
+            dofIndices.push(nodeIndex * 2);     // u
+            dofIndices.push(nodeIndex * 2 + 1); // v
           }
+
+          for (let i = 0; i < 8; i++) {
+            for (let j = 0; j < 8; j++) {
+              K.addAt(dofIndices[i], dofIndices[j], Ke.get(i, j));
+            }
+          }
+        } else if (nodes.length === 3) {
+          // 3-node triangle element (6x6 stiffness) — backward compatibility
+          const [n1, n2, n3] = nodes;
+          const Ke = calculateElementStiffness(n1, n2, n3, material, element.thickness, analysisType);
+
+          const dofIndices: number[] = [];
+          for (const node of nodes) {
+            const nodeIndex = nodeIdToIndex.get(node.id)!;
+            dofIndices.push(nodeIndex * 2);     // u
+            dofIndices.push(nodeIndex * 2 + 1); // v
+          }
+
+          for (let i = 0; i < 6; i++) {
+            for (let j = 0; j < 6; j++) {
+              K.addAt(dofIndices[i], dofIndices[j], Ke.get(i, j));
+            }
+          }
+        } else {
+          continue; // Skip unsupported element types
         }
       } catch (e) {
         console.warn(`Skipping element ${element.id}: ${e}`);
@@ -228,6 +242,8 @@ export function assembleForceVector(mesh: Mesh, analysisType: AnalysisType = 'pl
 
       let qx = beam.distributedLoad.qx;
       let qy = beam.distributedLoad.qy;
+      let qxE = beam.distributedLoad.qxEnd ?? qx;
+      let qyE = beam.distributedLoad.qyEnd ?? qy;
       const coordSystem = beam.distributedLoad.coordSystem ?? 'local';
       const startT = beam.distributedLoad.startT ?? 0;
       const endT = beam.distributedLoad.endT ?? 1;
@@ -236,16 +252,26 @@ export function assembleForceVector(mesh: Mesh, analysisType: AnalysisType = 'pl
       if (coordSystem === 'global') {
         const cos = Math.cos(angle);
         const sin = Math.sin(angle);
-        // Transform global (qx_global, qy_global) to local (qx_local, qy_local)
         const qxLocal = qx * cos + qy * sin;
         const qyLocal = -qx * sin + qy * cos;
+        const qxELocal = qxE * cos + qyE * sin;
+        const qyELocal = -qxE * sin + qyE * cos;
         qx = qxLocal;
         qy = qyLocal;
+        qxE = qxELocal;
+        qyE = qyELocal;
       }
 
       // Get equivalent nodal forces in local coordinates
+      const isTrapezoidal = qxE !== qx || qyE !== qy;
       let localForces: number[];
-      if (startT > 0 || endT < 1) {
+      if (isTrapezoidal) {
+        if (startT > 0 || endT < 1) {
+          localForces = calculatePartialTrapezoidalLoadVector(L, qx, qy, qxE, qyE, startT, endT);
+        } else {
+          localForces = calculateTrapezoidalLoadVector(L, qx, qy, qxE, qyE);
+        }
+      } else if (startT > 0 || endT < 1) {
         localForces = calculatePartialDistributedLoadVector(L, qx, qy, startT, endT);
       } else {
         localForces = calculateDistributedLoadVector(L, qx, qy);

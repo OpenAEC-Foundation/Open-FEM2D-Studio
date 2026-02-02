@@ -15,7 +15,8 @@
   background: var(--bg-primary);
   border: 1px solid var(--border);
   border-radius: 10px;
-  width: 720px;
+  width: 960px;
+  max-width: 95vw;
   max-height: 80vh;
   display: flex;
   flex-direction: column;
@@ -33,6 +34,12 @@
   justify-content: space-between;
 }
 
+.steel-check-controls {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
 .steel-check-grade-select {
   padding: 4px 8px;
   background: var(--bg-secondary);
@@ -42,9 +49,29 @@
   font-size: 12px;
 }
 
+.defl-limit-label {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  font-weight: 500;
+}
+
+.defl-limit-input {
+  width: 48px;
+  padding: 3px 6px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-light);
+  border-radius: 4px;
+  color: var(--text-primary);
+  font-size: 12px;
+  text-align: center;
+}
+
 .steel-check-body {
   flex: 1;
-  overflow-y: auto;
+  overflow: auto;
   padding: 12px;
 }
 
@@ -79,6 +106,46 @@
 
 .steel-check-table tr:hover td {
   background: rgba(255, 255, 255, 0.03);
+}
+
+/* UC cell color coding */
+.uc-cell {
+  font-weight: 600;
+  text-align: right;
+}
+
+.uc-cell.uc-ok {
+  color: var(--success);
+}
+
+.uc-cell.uc-warn {
+  color: var(--warning);
+}
+
+.uc-cell.uc-fail {
+  color: #ef4444;
+}
+
+.uc-cell.uc-na {
+  color: var(--text-muted);
+  font-weight: 400;
+}
+
+/* Governing check highlight */
+.uc-cell.uc-governing {
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+/* Governing label column */
+.governing-label {
+  font-size: 10px;
+  color: var(--text-secondary);
+  text-align: left !important;
+  white-space: nowrap;
+  max-width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .uc-bar {

@@ -66,6 +66,29 @@ export function formatMomentPerLength(value: number): string {
   return `${value.toFixed(2)} Nm/m`;
 }
 
+export function formatForcePerLength(value: number): string {
+  const absValue = Math.abs(value);
+  if (absValue >= 1e6) {
+    return `${(value / 1e6).toFixed(2)} MN/m`;
+  } else if (absValue >= 1e3) {
+    return `${(value / 1e3).toFixed(2)} kN/m`;
+  }
+  return `${value.toFixed(2)} N/m`;
+}
+
+/** Format a result value using the appropriate unit for the given stress type */
+export function formatResultValue(value: number, stressType: string): string {
+  switch (stressType) {
+    case 'mx': case 'my': case 'mxy':
+      return formatMomentPerLength(value);
+    case 'vx': case 'vy':
+    case 'nx': case 'ny': case 'nxy':
+      return formatForcePerLength(value);
+    default:
+      return formatStress(value);
+  }
+}
+
 export function formatDisplacement(value: number): string {
   // Always display in mm for structural engineering convention
   const mm = value * 1e3;

@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useCallback } from 'react';
 import { useFEM } from '../../context/FEMContext';
 import type { IProjectInfo } from '../../context/FEMContext';
 import './ProjectInfoDialog.css';
@@ -19,12 +19,46 @@ export function ProjectInfoDialog({ onClose }: ProjectInfoDialogProps) {
   const { state, dispatch } = useFEM();
 
   const [name, setName] = useState(state.projectInfo.name);
+  const [projectNumber, setProjectNumber] = useState(state.projectInfo.projectNumber || '');
   const [engineer, setEngineer] = useState(state.projectInfo.engineer);
   const [company, setCompany] = useState(state.projectInfo.company);
   const [date, setDate] = useState(state.projectInfo.date);
   const [description, setDescription] = useState(state.projectInfo.description);
   const [notes, setNotes] = useState(state.projectInfo.notes);
   const [location, setLocation] = useState(state.projectInfo.location);
+  const [latitude, setLatitude] = useState<number | undefined>(state.projectInfo.latitude);
+  const [longitude, setLongitude] = useState<number | undefined>(state.projectInfo.longitude);
+  const [geocoding, setGeocoding] = useState(false);
+
+  // Default map center: Netherlands
+  const defaultLat = 52.1326;
+  const defaultLon = 5.2913;
+  const mapLat = latitude ?? defaultLat;
+  const mapLon = longitude ?? defaultLon;
+  const mapZoom = latitude != null ? 14 : 7;
+  const mapSrc = `https://www.openstreetmap.org/export/embed.html?bbox=${mapLon - 0.02 / (mapZoom / 7)},${mapLat - 0.01 / (mapZoom / 7)},${mapLon + 0.02 / (mapZoom / 7)},${mapLat + 0.01 / (mapZoom / 7)}&layer=mapnik&marker=${mapLat},${mapLon}`;
+
+  const handleGeocode = useCallback(async () => {
+    if (!location.trim()) return;
+    setGeocoding(true);
+    try {
+      const resp = await fetch(
+        `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(location)}&format=json&limit=1`,
+        { headers: { 'Accept': 'application/json' } }
+      );
+      const data = await resp.json();
+      if (data && data.length > 0) {
+        const lat = parseFloat(data[0].lat);
+        const lon = parseFloat(data[0].lon);
+        setLatitude(lat);
+        setLongitude(lon);
+      }
+    } catch {
+      // geocoding failed silently
+    } finally {
+      setGeocoding(false);
+    }
+  }, [location]);
 
   // ERPNext linking
   const [showErpSearch, setShowErpSearch] = useState(false);
@@ -34,7 +68,7 @@ export function ProjectInfoDialog({ onClose }: ProjectInfoDialogProps) {
   const [erpError, setErpError] = useState<string | null>(null);
 
   const handleApply = () => {
-    const updated: IProjectInfo = { name, engineer, company, date, description, notes, location };
+    const updated: IProjectInfo = { name, projectNumber, engineer, company, date, description, notes, location, latitude, longitude };
     dispatch({ type: 'SET_PROJECT_INFO', payload: updated });
     onClose();
   };
@@ -119,12 +153,22 @@ export function ProjectInfoDialog({ onClose }: ProjectInfoDialogProps) {
 
         <div className="proj-info-body">
           <label className="proj-info-field">
+            <span>Project Number</span>
+            <input
+              type="text"
+              value={projectNumber}
+              onChange={e => setProjectNumber(e.target.value)}
+              autoFocus
+              onFocus={e => e.target.select()}
+              placeholder="e.g. PRJ-2026-001"
+            />
+          </label>
+          <label className="proj-info-field">
             <span>Name</span>
             <input
               type="text"
               value={name}
               onChange={e => setName(e.target.value)}
-              autoFocus
               onFocus={e => e.target.select()}
             />
           </label>
@@ -164,6 +208,39 @@ export function ProjectInfoDialog({ onClose }: ProjectInfoDialogProps) {
               onFocus={e => e.target.select()}
             />
           </label>
+          <div className="proj-info-map-section">
+            <div className="proj-info-map-controls">
+              <button
+                className="proj-info-map-btn"
+                onClick={handleGeocode}
+                disabled={geocoding || !location.trim()}
+              >
+                {geocoding ? 'Searching...' : 'Show on Map'}
+              </button>
+              {latitude != null && longitude != null && (
+                <span className="proj-info-coords">
+                  {latitude.toFixed(4)}, {longitude.toFixed(4)}
+                </span>
+              )}
+            </div>
+            <iframe
+              className="proj-info-map-iframe"
+              title="Project Location"
+              src={mapSrc}
+              width="300"
+              height="200"
+            />
+            <div className="proj-info-coord-fields">
+              <label className="proj-info-field">
+                <span>Latitude</span>
+                <input type="text" value={latitude != null ? latitude.toFixed(6) : ''} readOnly />
+              </label>
+              <label className="proj-info-field">
+                <span>Longitude</span>
+                <input type="text" value={longitude != null ? longitude.toFixed(6) : ''} readOnly />
+              </label>
+            </div>
+          </div>
           <label className="proj-info-field proj-info-field--tall">
             <span>Description</span>
             <textarea

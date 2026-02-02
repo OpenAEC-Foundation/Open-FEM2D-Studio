@@ -1,4 +1,4 @@
-import { INode, IElement, IMaterial, IMesh, ITriangleElement, IBeamElement, IBeamSection, IPlateRegion } from './types';
+import { INode, IElement, IMaterial, IMesh, ITriangleElement, IQuadElement, IBeamElement, IBeamSection, IPlateRegion, ISubNode } from './types';
 import { DEFAULT_MATERIALS } from './Material';
 import { DEFAULT_SECTIONS } from './Beam';
 
@@ -9,10 +9,13 @@ export class Mesh implements IMesh {
   materials: Map<number, IMaterial>;
   sections: Map<string, IBeamSection>;
   plateRegions: Map<number, IPlateRegion>;
+  subNodes: Map<number, ISubNode>;
   private nextNodeId: number;
   private nextElementId: number;
   private nextMaterialId: number;
   private nextPlateId: number;
+  private nextPlateNodeId: number;
+  private nextSubNodeId: number;
 
   constructor() {
     this.nodes = new Map();
@@ -21,10 +24,13 @@ export class Mesh implements IMesh {
     this.materials = new Map();
     this.sections = new Map();
     this.plateRegions = new Map();
+    this.subNodes = new Map();
     this.nextNodeId = 1;
     this.nextElementId = 1;
     this.nextMaterialId = 10;
     this.nextPlateId = 1;
+    this.nextPlateNodeId = 1000;
+    this.nextSubNodeId = 1;
 
     // Add default materials
     DEFAULT_MATERIALS.forEach(m => this.materials.set(m.id, { ...m }));
@@ -36,6 +42,19 @@ export class Mesh implements IMesh {
   addNode(x: number, y: number): INode {
     const node: INode = {
       id: this.nextNodeId++,
+      x,
+      y,
+      constraints: { x: false, y: false, rotation: false },
+      loads: { fx: 0, fy: 0, moment: 0 }
+    };
+    this.nodes.set(node.id, node);
+    return node;
+  }
+
+  /** Add a plate mesh node with ID starting from 1000 */
+  addPlateNode(x: number, y: number): INode {
+    const node: INode = {
+      id: this.nextPlateNodeId++,
       x,
       y,
       constraints: { x: false, y: false, rotation: false },
@@ -103,6 +122,17 @@ export class Mesh implements IMesh {
       }
     }
 
+    // Cascade: remove sub-nodes whose mesh node is being deleted or whose parent endpoints are removed
+    const subNodesToRemove: number[] = [];
+    for (const [snId, sn] of this.subNodes) {
+      if (sn.nodeId === id || sn.originalBeamStart === id || sn.originalBeamEnd === id) {
+        subNodesToRemove.push(snId);
+      }
+    }
+    for (const snId of subNodesToRemove) {
+      this.subNodes.delete(snId);
+    }
+
     return this.nodes.delete(id);
   }
 
@@ -136,12 +166,81 @@ export class Mesh implements IMesh {
     return element;
   }
 
+  addQuadElement(nodeIds: [number, number, number, number], materialId: number = 1, thickness: number = 0.01): IQuadElement | null {
+    // Verify all nodes exist
+    for (const nodeId of nodeIds) {
+      if (!this.nodes.has(nodeId)) return null;
+    }
+
+    // Verify material exists
+    if (!this.materials.has(materialId)) {
+      materialId = 1; // Default to steel
+    }
+
+    const element: IQuadElement = {
+      id: this.nextElementId++,
+      nodeIds,
+      materialId,
+      thickness
+    };
+    this.elements.set(element.id, element);
+    return element;
+  }
+
   removeElement(id: number): boolean {
     // Try to remove from triangles first, then beams
     if (this.elements.delete(id)) {
+      this.removeOrphanNodes();
       return true;
     }
-    return this.beamElements.delete(id);
+    if (this.beamElements.delete(id)) {
+      this.removeOrphanNodes();
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Find and remove all nodes that are not referenced by any element
+   * (beamElements, elements) or plate region.
+   * @returns Array of removed node IDs
+   */
+  removeOrphanNodes(): number[] {
+    // Build a set of all node IDs referenced by any element or plate region
+    const referencedNodeIds = new Set<number>();
+
+    for (const beam of this.beamElements.values()) {
+      for (const nodeId of beam.nodeIds) {
+        referencedNodeIds.add(nodeId);
+      }
+    }
+
+    for (const element of this.elements.values()) {
+      for (const nodeId of element.nodeIds) {
+        referencedNodeIds.add(nodeId);
+      }
+    }
+
+    for (const plate of this.plateRegions.values()) {
+      for (const nodeId of plate.nodeIds) {
+        referencedNodeIds.add(nodeId);
+      }
+    }
+
+    // Find orphan nodes (not referenced by anything)
+    const orphanIds: number[] = [];
+    for (const nodeId of this.nodes.keys()) {
+      if (!referencedNodeIds.has(nodeId)) {
+        orphanIds.push(nodeId);
+      }
+    }
+
+    // Remove orphan nodes
+    for (const nodeId of orphanIds) {
+      this.nodes.delete(nodeId);
+    }
+
+    return orphanIds;
   }
 
   addBeamElement(
@@ -326,6 +425,176 @@ export class Mesh implements IMesh {
     return this.splitBeamAt(beamId, position, { fx, fy, moment });
   }
 
+  /**
+   * Add a sub-node on a beam at parametric position t (0-1).
+   * This splits the beam into two new beams and records the sub-node.
+   */
+  addSubNode(beamId: number, t: number): ISubNode | null {
+    const beam = this.beamElements.get(beamId);
+    if (!beam) return null;
+
+    // Clamp t to valid range
+    t = Math.max(0.01, Math.min(0.99, t));
+
+    const nodes = this.getBeamElementNodes(beam);
+    if (!nodes) return null;
+
+    const [n1, n2] = nodes;
+
+    // Calculate interpolated position
+    const newX = n1.x + t * (n2.x - n1.x);
+    const newY = n1.y + t * (n2.y - n1.y);
+
+    // Create the new node
+    const newNode = this.addNode(newX, newY);
+
+    // Store original beam properties
+    const { materialId, section, distributedLoad, profileName, endReleases } = beam;
+
+    // Remove the original beam
+    this.beamElements.delete(beamId);
+
+    // Create two new beam elements
+    const beam1 = this.addBeamElement([n1.id, newNode.id], materialId, section, profileName);
+    const beam2 = this.addBeamElement([newNode.id, n2.id], materialId, section, profileName);
+
+    if (!beam1 || !beam2) return null;
+
+    // Copy distributed load if present
+    if (distributedLoad) {
+      this.updateBeamElement(beam1.id, { distributedLoad: { ...distributedLoad } });
+      this.updateBeamElement(beam2.id, { distributedLoad: { ...distributedLoad } });
+    }
+
+    // Copy end releases if present
+    if (endReleases) {
+      this.updateBeamElement(beam1.id, {
+        endReleases: { startMoment: endReleases.startMoment, endMoment: false }
+      });
+      this.updateBeamElement(beam2.id, {
+        endReleases: { startMoment: false, endMoment: endReleases.endMoment }
+      });
+    }
+
+    // Create sub-node record
+    const subNode: ISubNode = {
+      id: this.nextSubNodeId++,
+      beamId,
+      t,
+      nodeId: newNode.id,
+      originalBeamStart: n1.id,
+      originalBeamEnd: n2.id,
+      childBeamIds: [beam1.id, beam2.id]
+    };
+    this.subNodes.set(subNode.id, subNode);
+
+    return subNode;
+  }
+
+  /**
+   * Remove a sub-node: delete the two child beams and recreate the original beam.
+   */
+  removeSubNode(subNodeId: number): boolean {
+    const subNode = this.subNodes.get(subNodeId);
+    if (!subNode) return false;
+
+    // Get section properties from one of the child beams before deleting
+    const childBeam1 = this.beamElements.get(subNode.childBeamIds[0]);
+    const childBeam2 = this.beamElements.get(subNode.childBeamIds[1]);
+
+    const materialId = childBeam1?.materialId ?? childBeam2?.materialId ?? 1;
+    const section = childBeam1?.section ?? childBeam2?.section ?? { A: 53.8e-4, I: 8360e-8, h: 0.300 };
+    const profileName = childBeam1?.profileName ?? childBeam2?.profileName;
+    const distributedLoad = childBeam1?.distributedLoad ?? childBeam2?.distributedLoad;
+
+    // Gather end releases from the outer ends
+    const startRelease = childBeam1?.endReleases;
+    const endRelease = childBeam2?.endReleases;
+
+    // Delete child beams
+    this.beamElements.delete(subNode.childBeamIds[0]);
+    this.beamElements.delete(subNode.childBeamIds[1]);
+
+    // Delete the sub-node's mesh node
+    this.nodes.delete(subNode.nodeId);
+
+    // Recreate the original beam between the original endpoints
+    const startNode = this.nodes.get(subNode.originalBeamStart);
+    const endNode = this.nodes.get(subNode.originalBeamEnd);
+    if (startNode && endNode) {
+      const newBeam = this.addBeamElement([startNode.id, endNode.id], materialId, section, profileName);
+      if (newBeam) {
+        if (distributedLoad) {
+          this.updateBeamElement(newBeam.id, { distributedLoad: { ...distributedLoad } });
+        }
+        if (startRelease || endRelease) {
+          this.updateBeamElement(newBeam.id, {
+            endReleases: {
+              startMoment: startRelease?.startMoment ?? false,
+              endMoment: endRelease?.endMoment ?? false
+            }
+          });
+        }
+      }
+    }
+
+    // Remove sub-node record
+    this.subNodes.delete(subNodeId);
+    return true;
+  }
+
+  /**
+   * Update positions of all sub-nodes on beams connected to a given node.
+   * Call this after moving a node that is an endpoint of beams with sub-nodes.
+   */
+  updateSubNodePositions(movedNodeId: number): void {
+    for (const subNode of this.subNodes.values()) {
+      if (subNode.originalBeamStart === movedNodeId || subNode.originalBeamEnd === movedNodeId) {
+        const startNode = this.nodes.get(subNode.originalBeamStart);
+        const endNode = this.nodes.get(subNode.originalBeamEnd);
+        const subMeshNode = this.nodes.get(subNode.nodeId);
+        if (startNode && endNode && subMeshNode) {
+          const newX = startNode.x + subNode.t * (endNode.x - startNode.x);
+          const newY = startNode.y + subNode.t * (endNode.y - startNode.y);
+          this.updateNode(subNode.nodeId, { x: newX, y: newY });
+        }
+      }
+    }
+  }
+
+  /**
+   * Get all sub-nodes for a specific original beam ID.
+   */
+  getSubNodesForBeam(beamId: number): ISubNode[] {
+    const result: ISubNode[] = [];
+    for (const subNode of this.subNodes.values()) {
+      if (subNode.beamId === beamId) {
+        result.push(subNode);
+      }
+    }
+    return result;
+  }
+
+  /**
+   * Get sub-node by its mesh node ID.
+   */
+  getSubNodeByNodeId(nodeId: number): ISubNode | undefined {
+    for (const subNode of this.subNodes.values()) {
+      if (subNode.nodeId === nodeId) return subNode;
+    }
+    return undefined;
+  }
+
+  /**
+   * Check if a node ID belongs to a sub-node.
+   */
+  isSubNode(nodeId: number): boolean {
+    for (const subNode of this.subNodes.values()) {
+      if (subNode.nodeId === nodeId) return true;
+    }
+    return false;
+  }
+
   addPlateRegion(plate: IPlateRegion): IPlateRegion {
     plate.id = this.nextPlateId++;
     this.plateRegions.set(plate.id, plate);
@@ -354,9 +623,11 @@ export class Mesh implements IMesh {
     this.elements.clear();
     this.beamElements.clear();
     this.plateRegions.clear();
+    this.subNodes.clear();
     this.nextNodeId = 1;
     this.nextElementId = 1;
     this.nextPlateId = 1;
+    this.nextSubNodeId = 1;
   }
 
   getElementNodes(element: IElement): INode[] {
@@ -391,7 +662,8 @@ export class Mesh implements IMesh {
       beamElements: Array.from(this.beamElements.values()),
       materials: Array.from(this.materials.values()),
       sections: Array.from(this.sections.entries()).map(([name, section]) => ({ name, section })),
-      plateRegions: Array.from(this.plateRegions.values())
+      plateRegions: Array.from(this.plateRegions.values()),
+      subNodes: Array.from(this.subNodes.values())
     };
   }
 
@@ -402,6 +674,7 @@ export class Mesh implements IMesh {
     materials: IMaterial[];
     sections?: { name: string; section: IBeamSection }[];
     plateRegions?: IPlateRegion[];
+    subNodes?: ISubNode[];
   }): Mesh {
     const mesh = new Mesh();
     mesh.nodes.clear();
@@ -409,6 +682,7 @@ export class Mesh implements IMesh {
     mesh.beamElements.clear();
     mesh.materials.clear();
     mesh.plateRegions.clear();
+    mesh.subNodes.clear();
 
     data.materials.forEach(m => mesh.materials.set(m.id, m));
 
@@ -445,17 +719,29 @@ export class Mesh implements IMesh {
       data.plateRegions.forEach(p => mesh.plateRegions.set(p.id, p));
     }
 
+    if (data.subNodes) {
+      data.subNodes.forEach(sn => mesh.subNodes.set(sn.id, sn));
+    }
+
     const allElementIds = [
       ...data.elements.map(e => e.id),
       ...(data.beamElements || []).map(b => b.id)
     ];
 
     const allPlateIds = (data.plateRegions || []).map(p => p.id);
+    const allSubNodeIds = (data.subNodes || []).map(sn => sn.id);
 
     mesh.nextNodeId = Math.max(...data.nodes.map(n => n.id), 0) + 1;
     mesh.nextElementId = Math.max(...allElementIds, 0) + 1;
     mesh.nextMaterialId = Math.max(...data.materials.map(m => m.id), 10) + 1;
     mesh.nextPlateId = Math.max(...allPlateIds, 0) + 1;
+    mesh.nextSubNodeId = Math.max(...allSubNodeIds, 0) + 1;
+
+    // Restore nextPlateNodeId from plate node IDs (IDs >= 1000)
+    const plateNodeIds = data.nodes.filter(n => n.id >= 1000).map(n => n.id);
+    mesh.nextPlateNodeId = plateNodeIds.length > 0
+      ? Math.max(...plateNodeIds) + 1
+      : 1000;
 
     return mesh;
   }

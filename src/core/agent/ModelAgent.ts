@@ -1,0 +1,761 @@
+/**
+ * Model Agent: Natural language command parser and executor for structural models.
+ *
+ * Understands Dutch and English commands to create:
+ * - Portal frames (ongeschoord/geschoord portaal)
+ * - Simply supported beams (ligger / beam)
+ * - Cantilever beams (console / cantilever)
+ * - Trusses (vakwerk / truss)
+ * - Continuous beams (doorlopende ligger / continuous beam)
+ *
+ * No external LLM required - uses regex-based pattern matching.
+ */
+
+import { Mesh } from '../fem/Mesh';
+import { IBeamSection } from '../fem/types';
+import { ILoadCase } from '../fem/LoadCase';
+import { DEFAULT_SECTIONS } from '../fem/Beam';
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+export type StructureType = 'portal' | 'beam' | 'cantilever' | 'truss' | 'continuous_beam';
+
+export interface AgentCommand {
+  type: StructureType;
+  params: {
+    span?: number;         // meters
+    height?: number;       // meters (for portals, trusses)
+    load?: number;         // kN/m (distributed) or kN (point)
+    loadType?: 'distributed' | 'point';
+    spans?: number[];      // for continuous beams, multiple spans
+    numSpans?: number;     // number of spans for continuous beams
+    profile?: string;      // section profile name
+    braced?: boolean;      // for portal frames
+    numPanels?: number;    // for trusses
+    pointLoadPosition?: number; // fractional position for point loads (0-1)
+  };
+}
+
+export interface AgentResult {
+  success: boolean;
+  message: string;
+  details?: string;
+  nodeCount?: number;
+  elementCount?: number;
+}
+
+// ---------------------------------------------------------------------------
+// Section lookup helper
+// ---------------------------------------------------------------------------
+
+function findSection(name?: string): { section: IBeamSection; profileName: string } {
+  if (name) {
+    const upper = name.toUpperCase().replace(/\s+/g, ' ').trim();
+    for (const s of DEFAULT_SECTIONS) {
+      if (s.name.toUpperCase() === upper) {
+        return { section: { ...s.section }, profileName: s.name };
+      }
+    }
+    // Fuzzy match: check if input is contained or contains the section name
+    for (const s of DEFAULT_SECTIONS) {
+      if (s.name.toUpperCase().includes(upper) || upper.includes(s.name.toUpperCase())) {
+        return { section: { ...s.section }, profileName: s.name };
+      }
+    }
+  }
+  // Default to IPE 200
+  const def = DEFAULT_SECTIONS.find(s => s.name === 'IPE 200')!;
+  return { section: { ...def.section }, profileName: 'IPE 200' };
+}
+
+// ---------------------------------------------------------------------------
+// Number extraction helpers
+// ---------------------------------------------------------------------------
+
+/** Extract a number that may use comma as decimal separator */
+function parseNum(s: string): number {
+  return parseFloat(s.replace(',', '.'));
+}
+
+/**
+ * Extract the first number after a keyword pattern.
+ * Handles both "6m", "6 m", "6.5m", "6,5 m" forms.
+ */
+function extractNumber(text: string, pattern: RegExp): number | null {
+  const m = text.match(pattern);
+  if (!m) return null;
+  // Find the capture group that has a number
+  for (let i = 1; i < m.length; i++) {
+    if (m[i] !== undefined) {
+      return parseNum(m[i]);
+    }
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// Command Parser
+// ---------------------------------------------------------------------------
+
+export function parseCommand(input: string): AgentCommand | null {
+  const text = input.toLowerCase().trim();
+
+  // Detect structure type
+  let type: StructureType | null = null;
+
+  // Portal frame detection (NL + EN)
+  if (/portaal|portal\s*frame|portal/.test(text)) {
+    type = 'portal';
+  }
+  // Cantilever detection (NL + EN) - must check before 'beam'
+  else if (/console|cantilever|inklemming|ingeklem/.test(text)) {
+    type = 'cantilever';
+  }
+  // Truss detection (NL + EN)
+  else if (/vakwerk|truss|spant/.test(text)) {
+    type = 'truss';
+  }
+  // Continuous beam detection (NL + EN)
+  else if (/doorlopend|continuous|meervoudig|multi[\s-]?span/.test(text)) {
+    type = 'continuous_beam';
+  }
+  // Simple beam detection (NL + EN) - general fallback for beam-like terms
+  else if (/ligger|beam|balk|staaf|girder|simply\s*supported/.test(text)) {
+    type = 'beam';
+  }
+
+  if (!type) return null;
+
+  // Extract parameters
+  const params: AgentCommand['params'] = {};
+
+  // ------ Span / width ------
+  // "6m breed", "6 m wide", "span 8m", "overspanning 12m", "van 5m", "of 5m"
+  const spanPatterns = [
+    /(\d+[.,]?\d*)\s*m?\s*(?:breed|wide|width)/,
+    /(?:span|overspanning|lengte|length)\s*(?:van|of|:)?\s*(\d+[.,]?\d*)\s*m?/,
+    /(\d+[.,]?\d*)\s*m\b/,                     // fallback: first "Nm" token
+  ];
+  for (const pat of spanPatterns) {
+    const v = extractNumber(text, pat);
+    if (v !== null) { params.span = v; break; }
+  }
+
+  // ------ Height ------
+  const heightPatterns = [
+    /(\d+[.,]?\d*)\s*m?\s*(?:hoog|high|height|hoogte)/,
+    /(?:hoogte|height|hoog|high)\s*(?:van|of|:)?\s*(\d+[.,]?\d*)\s*m?/,
+  ];
+  for (const pat of heightPatterns) {
+    const v = extractNumber(text, pat);
+    if (v !== null) { params.height = v; break; }
+  }
+
+  // For trusses, try to get height from a second dimension if not already found
+  if (type === 'truss' && !params.height) {
+    // Pattern: "12m ... en 2m hoog" or "12m x 2m"
+    const trussHeight = text.match(/(?:en|and|x|bij)\s*(\d+[.,]?\d*)\s*m/);
+    if (trussHeight) {
+      params.height = parseNum(trussHeight[1]);
+    } else {
+      // Default truss height = span / 6
+      if (params.span) params.height = Math.max(1, params.span / 6);
+    }
+  }
+
+  // For portal frames default height
+  if (type === 'portal' && !params.height) {
+    params.height = params.span ? Math.max(3, params.span * 0.6) : 4;
+  }
+
+  // ------ Load ------
+  // Distributed load: "10 kN/m", "lijnlast van 10 kN/m", "UDL 15 kN/m"
+  const distLoadPattern = /(\d+[.,]?\d*)\s*kn\s*\/\s*m/;
+  const distMatch = text.match(distLoadPattern);
+  if (distMatch) {
+    params.load = parseNum(distMatch[1]);
+    params.loadType = 'distributed';
+  }
+
+  // Point load: "20 kN" (without /m), "puntlast 20 kN", "point load 20 kN"
+  if (!params.load) {
+    const ptLoadPattern = /(?:puntlast|point\s*load|kracht|force)?\s*(?:van|of)?\s*(\d+[.,]?\d*)\s*kn(?!\s*\/)/;
+    const ptMatch = text.match(ptLoadPattern);
+    if (ptMatch) {
+      params.load = parseNum(ptMatch[1]);
+      params.loadType = 'point';
+    }
+  }
+
+  // Detect load position hints
+  if (/tip|uiteinde|punt|end|vrij|free/.test(text)) {
+    params.pointLoadPosition = 1.0;
+  } else if (/midden|middle|mid|center|centre/.test(text)) {
+    params.pointLoadPosition = 0.5;
+  }
+
+  // ------ Profile ------
+  const profilePattern = /(?:profiel|profile|section|doorsnede)?\s*((?:ipe|hea|heb|tube|rectangle)\s*\d+(?:\s*x?\s*\d+)?)/i;
+  const profMatch = input.match(profilePattern); // use original case for profile
+  if (profMatch) {
+    params.profile = profMatch[1].trim();
+  }
+
+  // ------ Number of spans (continuous beam) ------
+  if (type === 'continuous_beam') {
+    const spanCountMatch = text.match(/(\d+)\s*(?:velden|spans|overspanningen|veld)/);
+    if (spanCountMatch) {
+      params.numSpans = parseInt(spanCountMatch[1]);
+    } else {
+      params.numSpans = 3; // default
+    }
+  }
+
+  // ------ Number of panels (truss) ------
+  if (type === 'truss') {
+    const panelMatch = text.match(/(\d+)\s*(?:panelen|panels|vakken|bays)/);
+    if (panelMatch) {
+      params.numPanels = parseInt(panelMatch[1]);
+    }
+  }
+
+  // ------ Braced ------
+  if (type === 'portal') {
+    params.braced = /geschoord|braced/.test(text) && !/ongeschoord|unbraced/.test(text);
+  }
+
+  // Apply defaults
+  if (!params.span) {
+    params.span = type === 'cantilever' ? 3 : type === 'truss' ? 12 : 6;
+  }
+
+  return { type, params };
+}
+
+// ---------------------------------------------------------------------------
+// Command Executor
+// ---------------------------------------------------------------------------
+
+export function executeCommand(
+  cmd: AgentCommand,
+  mesh: Mesh,
+  dispatch: (action: any) => void,
+  loadCases: ILoadCase[]
+): AgentResult {
+  // Push undo before making changes
+  dispatch({ type: 'PUSH_UNDO' });
+
+  // Clear the mesh for a fresh model
+  mesh.clear();
+
+  switch (cmd.type) {
+    case 'beam':
+      return createSimplySupported(cmd, mesh, dispatch, loadCases);
+    case 'cantilever':
+      return createCantilever(cmd, mesh, dispatch, loadCases);
+    case 'portal':
+      return createPortalFrame(cmd, mesh, dispatch, loadCases);
+    case 'truss':
+      return createTruss(cmd, mesh, dispatch, loadCases);
+    case 'continuous_beam':
+      return createContinuousBeam(cmd, mesh, dispatch, loadCases);
+    default:
+      return { success: false, message: `Unknown structure type: ${cmd.type}` };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Structure Builders
+// ---------------------------------------------------------------------------
+
+function createSimplySupported(
+  cmd: AgentCommand,
+  mesh: Mesh,
+  dispatch: (action: any) => void,
+  loadCases: ILoadCase[]
+): AgentResult {
+  const span = cmd.params.span!;
+  const { section, profileName } = findSection(cmd.params.profile);
+
+  // Nodes: left support, midpoint, right support
+  const n1 = mesh.addNode(0, 0);
+  const n2 = mesh.addNode(span / 2, 0);
+  const n3 = mesh.addNode(span, 0);
+
+  // Supports: pinned left, roller right
+  mesh.updateNode(n1.id, { constraints: { x: true, y: true, rotation: false } });
+  mesh.updateNode(n3.id, { constraints: { x: false, y: true, rotation: false } });
+
+  // Beam elements
+  const b1 = mesh.addBeamElement([n1.id, n2.id], 1, section, profileName);
+  const b2 = mesh.addBeamElement([n2.id, n3.id], 1, section, profileName);
+
+  // Update state
+  dispatch({ type: 'SET_MESH', payload: mesh });
+  dispatch({ type: 'REFRESH_MESH' });
+  dispatch({ type: 'SET_ANALYSIS_TYPE', payload: 'frame' });
+  dispatch({ type: 'SET_VIEW_MODE', payload: 'geometry' });
+
+  // Apply loads
+  let loadDesc = '';
+  if (cmd.params.load && cmd.params.loadType === 'distributed' && b1 && b2) {
+    const qy = -cmd.params.load * 1000; // kN/m to N/m, negative = downward
+    const lcId = loadCases.length > 0 ? loadCases[0].id : 1;
+    dispatch({ type: 'ADD_DISTRIBUTED_LOAD', payload: { lcId, beamId: b1.id, qx: 0, qy, coordSystem: 'global' } });
+    dispatch({ type: 'ADD_DISTRIBUTED_LOAD', payload: { lcId, beamId: b2.id, qx: 0, qy, coordSystem: 'global' } });
+    loadDesc = ` with ${cmd.params.load} kN/m distributed load`;
+  } else if (cmd.params.load && cmd.params.loadType === 'point') {
+    const fy = -cmd.params.load * 1000; // kN to N, negative = downward
+    const lcId = loadCases.length > 0 ? loadCases[0].id : 1;
+    // Apply at midpoint by default
+    dispatch({ type: 'ADD_POINT_LOAD', payload: { lcId, nodeId: n2.id, fx: 0, fy, mz: 0 } });
+    loadDesc = ` with ${cmd.params.load} kN point load at midspan`;
+  }
+
+  const details = [
+    `Span: ${span} m`,
+    `Profile: ${profileName}`,
+    `Nodes: 3, Elements: 2`,
+    `Supports: Pinned (left) + Roller (right)`,
+    loadDesc ? `Load:${loadDesc}` : 'No loads applied'
+  ].join('\n');
+
+  return {
+    success: true,
+    message: `Simply supported beam created (${span}m)${loadDesc}`,
+    details,
+    nodeCount: 3,
+    elementCount: 2
+  };
+}
+
+function createCantilever(
+  cmd: AgentCommand,
+  mesh: Mesh,
+  dispatch: (action: any) => void,
+  loadCases: ILoadCase[]
+): AgentResult {
+  const span = cmd.params.span!;
+  const { section, profileName } = findSection(cmd.params.profile);
+
+  // Nodes: fixed end, midpoint, free end
+  const n1 = mesh.addNode(0, 0);
+  const n2 = mesh.addNode(span / 2, 0);
+  const n3 = mesh.addNode(span, 0);
+
+  // Supports: fixed at left
+  mesh.updateNode(n1.id, { constraints: { x: true, y: true, rotation: true } });
+
+  // Beam elements
+  const b1 = mesh.addBeamElement([n1.id, n2.id], 1, section, profileName);
+  const b2 = mesh.addBeamElement([n2.id, n3.id], 1, section, profileName);
+
+  // Update state
+  dispatch({ type: 'SET_MESH', payload: mesh });
+  dispatch({ type: 'REFRESH_MESH' });
+  dispatch({ type: 'SET_ANALYSIS_TYPE', payload: 'frame' });
+  dispatch({ type: 'SET_VIEW_MODE', payload: 'geometry' });
+
+  // Apply loads
+  let loadDesc = '';
+  if (cmd.params.load && cmd.params.loadType === 'distributed' && b1 && b2) {
+    const qy = -cmd.params.load * 1000;
+    const lcId = loadCases.length > 0 ? loadCases[0].id : 1;
+    dispatch({ type: 'ADD_DISTRIBUTED_LOAD', payload: { lcId, beamId: b1.id, qx: 0, qy, coordSystem: 'global' } });
+    dispatch({ type: 'ADD_DISTRIBUTED_LOAD', payload: { lcId, beamId: b2.id, qx: 0, qy, coordSystem: 'global' } });
+    loadDesc = ` with ${cmd.params.load} kN/m distributed load`;
+  } else if (cmd.params.load && cmd.params.loadType === 'point') {
+    const fy = -cmd.params.load * 1000;
+    const lcId = loadCases.length > 0 ? loadCases[0].id : 1;
+    // Default: load at tip
+    const targetNode = cmd.params.pointLoadPosition === 0.5 ? n2.id : n3.id;
+    const posLabel = cmd.params.pointLoadPosition === 0.5 ? 'midspan' : 'tip';
+    dispatch({ type: 'ADD_POINT_LOAD', payload: { lcId, nodeId: targetNode, fx: 0, fy, mz: 0 } });
+    loadDesc = ` with ${cmd.params.load} kN point load at ${posLabel}`;
+  }
+
+  const details = [
+    `Length: ${span} m`,
+    `Profile: ${profileName}`,
+    `Nodes: 3, Elements: 2`,
+    `Supports: Fixed (left)`,
+    loadDesc ? `Load:${loadDesc}` : 'No loads applied'
+  ].join('\n');
+
+  return {
+    success: true,
+    message: `Cantilever beam created (${span}m)${loadDesc}`,
+    details,
+    nodeCount: 3,
+    elementCount: 2
+  };
+}
+
+function createPortalFrame(
+  cmd: AgentCommand,
+  mesh: Mesh,
+  dispatch: (action: any) => void,
+  loadCases: ILoadCase[]
+): AgentResult {
+  const span = cmd.params.span!;
+  const height = cmd.params.height!;
+  const { section, profileName } = findSection(cmd.params.profile);
+
+  // Nodes: 4 corners + midpoint on beam
+  //   n1 (0,0) -- bottom left
+  //   n2 (0,H) -- top left
+  //   n3 (L/2,H) -- midpoint top
+  //   n4 (L,H) -- top right
+  //   n5 (L,0) -- bottom right
+  const n1 = mesh.addNode(0, 0);
+  const n2 = mesh.addNode(0, height);
+  const n3 = mesh.addNode(span / 2, height);
+  const n4 = mesh.addNode(span, height);
+  const n5 = mesh.addNode(span, 0);
+
+  // Supports: both base nodes fixed
+  mesh.updateNode(n1.id, { constraints: { x: true, y: true, rotation: true } });
+  mesh.updateNode(n5.id, { constraints: { x: true, y: true, rotation: true } });
+
+  // Columns
+  mesh.addBeamElement([n1.id, n2.id], 1, section, profileName);
+  mesh.addBeamElement([n5.id, n4.id], 1, section, profileName);
+
+  // Beam (rafter)
+  const b1 = mesh.addBeamElement([n2.id, n3.id], 1, section, profileName);
+  const b2 = mesh.addBeamElement([n3.id, n4.id], 1, section, profileName);
+
+  // Update state
+  dispatch({ type: 'SET_MESH', payload: mesh });
+  dispatch({ type: 'REFRESH_MESH' });
+  dispatch({ type: 'SET_ANALYSIS_TYPE', payload: 'frame' });
+  dispatch({ type: 'SET_VIEW_MODE', payload: 'geometry' });
+
+  // Apply loads on the beam (rafter)
+  let loadDesc = '';
+  if (cmd.params.load && cmd.params.loadType === 'distributed' && b1 && b2) {
+    const qy = -cmd.params.load * 1000;
+    const lcId = loadCases.length > 0 ? loadCases[0].id : 1;
+    dispatch({ type: 'ADD_DISTRIBUTED_LOAD', payload: { lcId, beamId: b1.id, qx: 0, qy, coordSystem: 'global' } });
+    dispatch({ type: 'ADD_DISTRIBUTED_LOAD', payload: { lcId, beamId: b2.id, qx: 0, qy, coordSystem: 'global' } });
+    loadDesc = ` with ${cmd.params.load} kN/m on rafter`;
+  } else if (cmd.params.load && cmd.params.loadType === 'point') {
+    const fy = -cmd.params.load * 1000;
+    const lcId = loadCases.length > 0 ? loadCases[0].id : 1;
+    dispatch({ type: 'ADD_POINT_LOAD', payload: { lcId, nodeId: n3.id, fx: 0, fy, mz: 0 } });
+    loadDesc = ` with ${cmd.params.load} kN point load at mid-rafter`;
+  }
+
+  const details = [
+    `Width: ${span} m, Height: ${height} m`,
+    `Profile: ${profileName}`,
+    `Nodes: 5, Elements: 4 (2 columns + 2 rafter segments)`,
+    `Supports: Fixed at both bases`,
+    loadDesc ? `Load:${loadDesc}` : 'No loads applied'
+  ].join('\n');
+
+  return {
+    success: true,
+    message: `Portal frame created (${span}m x ${height}m)${loadDesc}`,
+    details,
+    nodeCount: 5,
+    elementCount: 4
+  };
+}
+
+function createTruss(
+  cmd: AgentCommand,
+  mesh: Mesh,
+  dispatch: (action: any) => void,
+  loadCases: ILoadCase[]
+): AgentResult {
+  const span = cmd.params.span!;
+  const height = cmd.params.height ?? Math.max(1, span / 6);
+  const numPanels = cmd.params.numPanels ?? Math.max(4, Math.round(span / 2));
+  const { section, profileName } = findSection(cmd.params.profile);
+
+  const panelWidth = span / numPanels;
+
+  // Create bottom chord nodes
+  const bottomNodes: number[] = [];
+  for (let i = 0; i <= numPanels; i++) {
+    const n = mesh.addNode(i * panelWidth, 0);
+    bottomNodes.push(n.id);
+  }
+
+  // Create top chord nodes
+  const topNodes: number[] = [];
+  for (let i = 0; i <= numPanels; i++) {
+    const n = mesh.addNode(i * panelWidth, height);
+    topNodes.push(n.id);
+  }
+
+  // Supports: pinned left, roller right
+  mesh.updateNode(bottomNodes[0], { constraints: { x: true, y: true, rotation: false } });
+  mesh.updateNode(bottomNodes[numPanels], { constraints: { x: false, y: true, rotation: false } });
+
+  let elementCount = 0;
+
+  // Bottom chord elements
+  for (let i = 0; i < numPanels; i++) {
+    const beam = mesh.addBeamElement([bottomNodes[i], bottomNodes[i + 1]], 1, section, profileName);
+    if (beam) {
+      mesh.updateBeamElement(beam.id, { endReleases: { startMoment: true, endMoment: true } });
+      elementCount++;
+    }
+  }
+
+  // Top chord elements
+  for (let i = 0; i < numPanels; i++) {
+    const beam = mesh.addBeamElement([topNodes[i], topNodes[i + 1]], 1, section, profileName);
+    if (beam) {
+      mesh.updateBeamElement(beam.id, { endReleases: { startMoment: true, endMoment: true } });
+      elementCount++;
+    }
+  }
+
+  // Vertical elements
+  for (let i = 0; i <= numPanels; i++) {
+    const beam = mesh.addBeamElement([bottomNodes[i], topNodes[i]], 1, section, profileName);
+    if (beam) {
+      mesh.updateBeamElement(beam.id, { endReleases: { startMoment: true, endMoment: true } });
+      elementCount++;
+    }
+  }
+
+  // Diagonal elements (Pratt truss pattern)
+  for (let i = 0; i < numPanels; i++) {
+    const beam = mesh.addBeamElement([bottomNodes[i], topNodes[i + 1]], 1, section, profileName);
+    if (beam) {
+      mesh.updateBeamElement(beam.id, { endReleases: { startMoment: true, endMoment: true } });
+      elementCount++;
+    }
+  }
+
+  const totalNodes = (numPanels + 1) * 2;
+
+  // Update state
+  dispatch({ type: 'SET_MESH', payload: mesh });
+  dispatch({ type: 'REFRESH_MESH' });
+  dispatch({ type: 'SET_ANALYSIS_TYPE', payload: 'frame' });
+  dispatch({ type: 'SET_VIEW_MODE', payload: 'geometry' });
+
+  // Apply loads at top chord nodes
+  let loadDesc = '';
+  if (cmd.params.load) {
+    const lcId = loadCases.length > 0 ? loadCases[0].id : 1;
+    if (cmd.params.loadType === 'distributed') {
+      // Convert distributed load to equivalent point loads on top chord
+      const tributaryLength = panelWidth;
+      for (let i = 0; i <= numPanels; i++) {
+        const factor = (i === 0 || i === numPanels) ? 0.5 : 1.0;
+        const fy = -cmd.params.load * 1000 * tributaryLength * factor;
+        dispatch({ type: 'ADD_POINT_LOAD', payload: { lcId, nodeId: topNodes[i], fx: 0, fy, mz: 0 } });
+      }
+      loadDesc = ` with ${cmd.params.load} kN/m on top chord`;
+    } else {
+      // Point load at midspan top chord
+      const midIdx = Math.floor(numPanels / 2);
+      const fy = -cmd.params.load * 1000;
+      dispatch({ type: 'ADD_POINT_LOAD', payload: { lcId, nodeId: topNodes[midIdx], fx: 0, fy, mz: 0 } });
+      loadDesc = ` with ${cmd.params.load} kN point load at midspan`;
+    }
+  }
+
+  const details = [
+    `Span: ${span} m, Height: ${height} m`,
+    `Panels: ${numPanels} (Pratt pattern)`,
+    `Profile: ${profileName}`,
+    `Nodes: ${totalNodes}, Elements: ${elementCount}`,
+    `Supports: Pinned (left) + Roller (right)`,
+    `All connections: hinged (truss)`,
+    loadDesc ? `Load:${loadDesc}` : 'No loads applied'
+  ].join('\n');
+
+  return {
+    success: true,
+    message: `Pratt truss created (${span}m x ${height}m, ${numPanels} panels)${loadDesc}`,
+    details,
+    nodeCount: totalNodes,
+    elementCount
+  };
+}
+
+function createContinuousBeam(
+  cmd: AgentCommand,
+  mesh: Mesh,
+  dispatch: (action: any) => void,
+  loadCases: ILoadCase[]
+): AgentResult {
+  const spanLength = cmd.params.span!;
+  const numSpans = cmd.params.numSpans ?? 3;
+  const { section, profileName } = findSection(cmd.params.profile);
+
+  const nodes: number[] = [];
+  const midNodes: number[] = [];
+  const beamIds: number[] = [];
+
+  for (let i = 0; i <= numSpans; i++) {
+    const n = mesh.addNode(i * spanLength, 0);
+    nodes.push(n.id);
+
+    // Add midspan nodes (except after last support)
+    if (i < numSpans) {
+      const mid = mesh.addNode((i + 0.5) * spanLength, 0);
+      midNodes.push(mid.id);
+    }
+  }
+
+  // Supports: pinned at first, roller at all others
+  mesh.updateNode(nodes[0], { constraints: { x: true, y: true, rotation: false } });
+  for (let i = 1; i <= numSpans; i++) {
+    mesh.updateNode(nodes[i], { constraints: { x: false, y: true, rotation: false } });
+  }
+
+  // Create beam elements between consecutive nodes (support - mid - support)
+  for (let i = 0; i < numSpans; i++) {
+    const b1 = mesh.addBeamElement([nodes[i], midNodes[i]], 1, section, profileName);
+    const b2 = mesh.addBeamElement([midNodes[i], nodes[i + 1]], 1, section, profileName);
+    if (b1) beamIds.push(b1.id);
+    if (b2) beamIds.push(b2.id);
+  }
+
+  // Update state
+  dispatch({ type: 'SET_MESH', payload: mesh });
+  dispatch({ type: 'REFRESH_MESH' });
+  dispatch({ type: 'SET_ANALYSIS_TYPE', payload: 'frame' });
+  dispatch({ type: 'SET_VIEW_MODE', payload: 'geometry' });
+
+  // Apply loads
+  let loadDesc = '';
+  if (cmd.params.load && cmd.params.loadType === 'distributed') {
+    const qy = -cmd.params.load * 1000;
+    const lcId = loadCases.length > 0 ? loadCases[0].id : 1;
+    for (const bId of beamIds) {
+      dispatch({ type: 'ADD_DISTRIBUTED_LOAD', payload: { lcId, beamId: bId, qx: 0, qy, coordSystem: 'global' } });
+    }
+    loadDesc = ` with ${cmd.params.load} kN/m distributed load`;
+  } else if (cmd.params.load && cmd.params.loadType === 'point') {
+    const fy = -cmd.params.load * 1000;
+    const lcId = loadCases.length > 0 ? loadCases[0].id : 1;
+    // Apply point loads at midspan of each span
+    for (const midId of midNodes) {
+      dispatch({ type: 'ADD_POINT_LOAD', payload: { lcId, nodeId: midId, fx: 0, fy, mz: 0 } });
+    }
+    loadDesc = ` with ${cmd.params.load} kN point loads at each midspan`;
+  }
+
+  const totalNodes = nodes.length + midNodes.length;
+  const totalElements = beamIds.length;
+  const totalSpan = numSpans * spanLength;
+
+  const details = [
+    `Total length: ${totalSpan} m (${numSpans} spans of ${spanLength} m)`,
+    `Profile: ${profileName}`,
+    `Nodes: ${totalNodes}, Elements: ${totalElements}`,
+    `Supports: Pinned + ${numSpans} Rollers`,
+    loadDesc ? `Load:${loadDesc}` : 'No loads applied'
+  ].join('\n');
+
+  return {
+    success: true,
+    message: `Continuous beam created (${numSpans}x ${spanLength}m)${loadDesc}`,
+    details,
+    nodeCount: totalNodes,
+    elementCount: totalElements
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Help / description generator
+// ---------------------------------------------------------------------------
+
+export function getHelpText(): string {
+  return `I can create structural models from natural language commands in Dutch and English.
+
+Supported structures:
+  - Simply supported beam (ligger/beam)
+  - Cantilever beam (console/cantilever)
+  - Portal frame (portaal/portal)
+  - Truss (vakwerk/truss)
+  - Continuous beam (doorlopende ligger/continuous beam)
+
+Example commands:
+  "Teken een ligger van 8m met lijnlast 10 kN/m"
+  "Create a simply supported beam 5m with UDL 15 kN/m"
+  "Maak een portaal van 6m breed en 4m hoog met 10 kN/m"
+  "Draw a cantilever 3m with point load 20 kN at the tip"
+  "Teken een vakwerk van 12m overspanning en 2m hoog"
+  "Create a continuous beam 5m, 3 spans with 8 kN/m"
+
+Parameters I understand:
+  - Span/width (in meters)
+  - Height (for portals and trusses)
+  - Loads (kN/m for distributed, kN for point)
+  - Profiles (e.g., IPE 200, HEA 200)
+  - Number of panels (for trusses)
+  - Number of spans (for continuous beams)`;
+}
+
+// ---------------------------------------------------------------------------
+// Process: parse + execute convenience
+// ---------------------------------------------------------------------------
+
+export function processAgentInput(
+  input: string,
+  mesh: Mesh,
+  dispatch: (action: any) => void,
+  loadCases: ILoadCase[]
+): AgentResult {
+  const text = input.toLowerCase().trim();
+
+  // Check for help commands
+  if (/^(help|hulp|wat kan je|what can you|\?)/.test(text)) {
+    return { success: true, message: getHelpText() };
+  }
+
+  // Check for clear/reset commands
+  if (/^(clear|wis|reset|nieuw|new|leeg)/.test(text)) {
+    dispatch({ type: 'PUSH_UNDO' });
+    mesh.clear();
+    dispatch({ type: 'SET_MESH', payload: mesh });
+    dispatch({ type: 'REFRESH_MESH' });
+    // Reset load cases to defaults
+    dispatch({
+      type: 'SET_LOAD_CASES',
+      payload: [
+        {
+          id: 1, name: 'Dead Load (G)', type: 'dead' as const,
+          pointLoads: [], distributedLoads: [], edgeLoads: [], thermalLoads: [],
+          color: '#6b7280'
+        },
+        {
+          id: 2, name: 'Live Load (Q)', type: 'live' as const,
+          pointLoads: [], distributedLoads: [], edgeLoads: [], thermalLoads: [],
+          color: '#3b82f6'
+        }
+      ]
+    });
+    return { success: true, message: 'Model cleared.' };
+  }
+
+  // Try to parse as a structural command
+  const cmd = parseCommand(input);
+  if (!cmd) {
+    return {
+      success: false,
+      message: `I could not understand that command. Type "help" to see what I can do.
+
+I need a structure type keyword like:
+  - beam / ligger / balk
+  - cantilever / console
+  - portal / portaal
+  - truss / vakwerk
+  - continuous beam / doorlopende ligger`
+    };
+  }
+
+  return executeCommand(cmd, mesh, dispatch, loadCases);
+}

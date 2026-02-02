@@ -12,7 +12,8 @@
   background: var(--bg-primary);
   border: 1px solid var(--border-light);
   border-radius: 8px;
-  width: 420px;
+  width: 480px;
+  max-height: 90vh;
   display: flex;
   flex-direction: column;
   box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
@@ -136,6 +137,7 @@
   display: flex;
   flex-direction: column;
   gap: 10px;
+  overflow-y: auto;
 }
 
 .proj-info-field {
@@ -235,4 +237,74 @@
 
 .proj-info-btn.confirm:hover {
   background: var(--accent-hover);
+}
+
+/* Map section */
+.proj-info-map-section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-left: 88px;
+}
+
+.proj-info-map-controls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.proj-info-map-btn {
+  padding: 4px 12px;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-light);
+  border-radius: 4px;
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.proj-info-map-btn:hover:not(:disabled) {
+  background: var(--accent-subtle);
+  border-color: var(--accent);
+}
+
+.proj-info-map-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.proj-info-coords {
+  font-size: 11px;
+  color: var(--text-muted);
+  font-family: 'JetBrains Mono', monospace;
+}
+
+.proj-info-map-iframe {
+  border: 1px solid var(--border-light);
+  border-radius: 4px;
+  width: 300px;
+  height: 200px;
+}
+
+.proj-info-coord-fields {
+  display: flex;
+  gap: 8px;
+}
+
+.proj-info-coord-fields .proj-info-field {
+  flex: 1;
+}
+
+.proj-info-coord-fields .proj-info-field span {
+  min-width: 60px;
+  font-size: 11px;
+}
+
+.proj-info-coord-fields .proj-info-field input {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  background: var(--bg-secondary);
+  color: var(--text-muted);
 }

@@ -3,6 +3,7 @@ import { Mesh } from '../fem/Mesh';
 import { ISolverResult, IElementStress, IBeamForces, AnalysisType } from '../fem/types';
 import { assembleGlobalStiffnessMatrix, assembleForceVector, getConstrainedDofs } from './Assembler';
 import { calculateElementStress, calculatePrincipalStresses } from '../fem/Triangle';
+import { calculateQuadStress } from '../fem/Quad4';
 import { calculateBeamInternalForces } from '../fem/BeamForces';
 
 export interface SolverOptions {
@@ -62,12 +63,10 @@ export function solve(mesh: Mesh, options: SolverOptions): ISolverResult {
   if (analysisType !== 'frame') {
     for (const element of mesh.elements.values()) {
       const nodes = mesh.getElementNodes(element);
-      if (nodes.length !== 3) continue;
+      if (nodes.length < 3 || nodes.length > 4) continue;
 
       const material = mesh.getMaterial(element.materialId);
       if (!material) continue;
-
-      const [n1, n2, n3] = nodes;
 
       // Get element displacements
       const elemDisp: number[] = [];
@@ -77,13 +76,16 @@ export function solve(mesh: Mesh, options: SolverOptions): ISolverResult {
         elemDisp.push(displacements[nodeIndex * 2 + 1]); // v
       }
 
-      const { sigmaX, sigmaY, tauXY, vonMises } = calculateElementStress(
-        n1, n2, n3,
-        material,
-        elemDisp,
-        analysisType
-      );
+      let stressResult: { sigmaX: number; sigmaY: number; tauXY: number; vonMises: number };
+      if (nodes.length === 4) {
+        const [n1, n2, n3, n4] = nodes;
+        stressResult = calculateQuadStress(n1, n2, n3, n4, material, elemDisp, analysisType);
+      } else {
+        const [n1, n2, n3] = nodes;
+        stressResult = calculateElementStress(n1, n2, n3, material, elemDisp, analysisType);
+      }
 
+      const { sigmaX, sigmaY, tauXY, vonMises } = stressResult;
       const principal = calculatePrincipalStresses(sigmaX, sigmaY, tauXY);
 
       const stress: IElementStress = {

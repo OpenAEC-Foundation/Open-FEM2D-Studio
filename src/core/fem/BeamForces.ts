@@ -3,7 +3,11 @@ import {
   calculateBeamLength,
   calculateBeamAngle,
   calculateBeamLocalStiffness,
-  transformGlobalToLocal
+  transformGlobalToLocal,
+  calculateTrapezoidalLoadVector,
+  calculatePartialTrapezoidalLoadVector,
+  calculateDistributedLoadVector,
+  calculatePartialDistributedLoadVector,
 } from './Beam';
 
 const NUM_STATIONS = 21; // Number of points along beam for diagrams
@@ -30,8 +34,28 @@ export function calculateBeamInternalForces(
   const localDisp = transformGlobalToLocal(globalDisplacements, angle);
 
   // Get distributed loads (in local coordinates)
-  const qx = element.distributedLoad?.qx ?? 0;
-  const qy = element.distributedLoad?.qy ?? 0;
+  let qxS = element.distributedLoad?.qx ?? 0;
+  let qyS = element.distributedLoad?.qy ?? 0;
+  let qxE = element.distributedLoad?.qxEnd ?? qxS;
+  let qyE = element.distributedLoad?.qyEnd ?? qyS;
+  const coordSystem = element.distributedLoad?.coordSystem ?? 'local';
+  const startT = element.distributedLoad?.startT ?? 0;
+  const endT = element.distributedLoad?.endT ?? 1;
+
+  // If global coordinate system, project to local axes
+  if (coordSystem === 'global') {
+    const cos = Math.cos(angle);
+    const sin = Math.sin(angle);
+    const qxSL = qxS * cos + qyS * sin;
+    const qySL = -qxS * sin + qyS * cos;
+    const qxEL = qxE * cos + qyE * sin;
+    const qyEL = -qxE * sin + qyE * cos;
+    qxS = qxSL; qyS = qySL;
+    qxE = qxEL; qyE = qyEL;
+  }
+
+  const isTrapezoidal = qxE !== qxS || qyE !== qyS;
+  const isPartial = startT > 0 || endT < 1;
 
   // Calculate local stiffness matrix
   const Kl = calculateBeamLocalStiffness(L, material.E, element.section.A, element.section.I);
@@ -45,34 +69,28 @@ export function calculateBeamInternalForces(
   }
 
   // Subtract equivalent nodal forces to get actual internal forces
-  // K*d already includes the effect of distributed loads through the solver
-  // (equivalent nodal forces were added to F before solving)
-  // To get actual internal forces: f_internal = K*d - F_equiv
-  const equivalentNodalForces = [
-    qx * L / 2,           // Axial at node 1
-    qy * L / 2,           // Shear at node 1
-    qy * L * L / 12,      // Moment at node 1
-    qx * L / 2,           // Axial at node 2
-    qy * L / 2,           // Shear at node 2
-    -qy * L * L / 12      // Moment at node 2
-  ];
+  let equivalentNodalForces: number[];
+  if (isTrapezoidal) {
+    equivalentNodalForces = isPartial
+      ? calculatePartialTrapezoidalLoadVector(L, qxS, qyS, qxE, qyE, startT, endT)
+      : calculateTrapezoidalLoadVector(L, qxS, qyS, qxE, qyE);
+  } else if (isPartial) {
+    equivalentNodalForces = calculatePartialDistributedLoadVector(L, qxS, qyS, startT, endT);
+  } else {
+    equivalentNodalForces = calculateDistributedLoadVector(L, qxS, qyS);
+  }
 
   // Internal forces = stiffness forces - equivalent nodal forces
   for (let i = 0; i < 6; i++) {
     localForces[i] -= equivalentNodalForces[i];
   }
 
-  // End forces in element local coordinates
-  // After subtracting equivalent nodal forces, localForces = K*d - F_equiv
-  // Sign conventions for internal forces:
-  // - V positive: causes clockwise rotation of element
-  // - M positive: causes tension in bottom fiber (sagging)
-  const N1 = localForces[0];   // Axial at node 1
-  const V1 = localForces[1];   // Shear at node 1
-  const M1 = -localForces[2];  // Moment at node 1 (sign flip for internal moment convention)
-  const N2 = -localForces[3];  // Axial at node 2
-  const V2 = -localForces[4];  // Shear at node 2
-  const M2 = localForces[5];   // Moment at node 2
+  const N1 = localForces[0];
+  const V1 = localForces[1];
+  const M1 = -localForces[2];
+  const N2 = -localForces[3];
+  const V2 = -localForces[4];
+  const M2 = localForces[5];
 
   // Generate stations along beam for diagram plotting
   const stations: number[] = [];
@@ -84,19 +102,51 @@ export function calculateBeamInternalForces(
     const x = (i / (NUM_STATIONS - 1)) * L;
     stations.push(x);
 
-    // N(x) - axial force (constant for no distributed axial load)
-    // With distributed axial load: N(x) = N1 + qx * x
-    const N_x = N1 + qx * x;
+    // N(x) = N1 + integral of qx from 0 to x
+    // For trapezoidal partial: integrate piecewise
+    let intQx = 0;
+    let intQy = 0;
+    let intQyMoment = 0; // integral of qy*(x-s) ds from load start to x
+
+    if (x > startT * L) {
+      const loadStart = startT * L;
+      const loadEnd = Math.min(x, endT * L);
+      if (loadEnd > loadStart) {
+        const span = (endT - startT) * L;
+        const tStart = 0; // at loadStart, t=0
+        const tEnd = span > 0 ? (loadEnd - loadStart) / span : 0;
+        // q(s) = qxS + (qxE - qxS) * ((s - loadStart) / span)
+        // integral from loadStart to loadEnd = qxS*(loadEnd-loadStart) + (qxE-qxS)*(loadEnd-loadStart)^2/(2*span)
+        const ds = loadEnd - loadStart;
+        intQx = qxS * ds + (qxE - qxS) * ds * (tStart + tEnd) / 2;
+        intQy = qyS * ds + (qyE - qyS) * ds * (tStart + tEnd) / 2;
+
+        // For moment: integral of qy(s) * (x - s) ds from loadStart to loadEnd
+        // Using numerical integration (Simpson's rule, 10 intervals)
+        const nSub = 10;
+        const hSub = ds / nSub;
+        let sum = 0;
+        for (let k = 0; k <= nSub; k++) {
+          const s = loadStart + k * hSub;
+          const tK = span > 0 ? (s - loadStart) / span : 0;
+          const qy_s = qyS + (qyE - qyS) * tK;
+          let w: number;
+          if (k === 0 || k === nSub) w = 1;
+          else if (k % 2 === 1) w = 4;
+          else w = 2;
+          sum += w * qy_s * (x - s);
+        }
+        intQyMoment = sum * hSub / 3;
+      }
+    }
+
+    const N_x = N1 + intQx;
     normalForce.push(N_x);
 
-    // V(x) - shear force
-    // With distributed transverse load: V(x) = V1 + qy * x
-    const V_x = V1 + qy * x;
+    const V_x = V1 + intQy;
     shearForce.push(V_x);
 
-    // M(x) - bending moment
-    // With distributed load: M(x) = M1 + V1*x + qy*x²/2
-    const M_x = M1 + V1 * x + qy * x * x / 2;
+    const M_x = M1 + V1 * x + intQyMoment;
     bendingMoment.push(M_x);
   }
 

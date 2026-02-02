@@ -88,6 +88,7 @@ export function ConcreteCheckPanel({ onClose }: ConcreteCheckPanelProps) {
                   <th>A<sub>s,min</sub> (mm²)</th>
                   <th>Reinforcement</th>
                   <th>V<sub>Rd,c</sub> ({forceUnit})</th>
+                  <th>w<sub>k</sub> (mm)</th>
                   <th>UC</th>
                   <th>Status</th>
                 </tr>
@@ -103,6 +104,14 @@ export function ConcreteCheckPanel({ onClose }: ConcreteCheckPanelProps) {
                     <td>{r.AsMin.toFixed(0)}</td>
                     <td style={{ textAlign: 'left' }}>{r.AsProvided}</td>
                     <td>{formatForce(r.VRdc)}</td>
+                    <td style={{
+                      color: r.crackWidth
+                        ? (r.crackWidth.wk <= r.crackWidth.wkLimit ? 'var(--success)' : '#ef4444')
+                        : 'var(--text-secondary)',
+                      fontWeight: 500
+                    }}>
+                      {r.crackWidth ? r.crackWidth.wk.toFixed(2) : '—'}
+                    </td>
                     <td style={{ color: r.UC_M <= 0.85 ? 'var(--success)' : r.UC_M <= 1.0 ? 'var(--warning)' : '#ef4444', fontWeight: 600 }}>
                       {r.UC_M.toFixed(2)}
                     </td>

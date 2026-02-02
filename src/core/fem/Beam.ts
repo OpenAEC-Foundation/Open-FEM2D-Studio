@@ -242,6 +242,108 @@ function integrate_N4(a: number, b: number, L: number): number {
 }
 
 /**
+ * Calculate equivalent nodal forces for a full-span trapezoidal distributed load.
+ * qxStart/qyStart at node 1, qxEnd/qyEnd at node 2.
+ * q(x) = qStart + (qEnd - qStart) * x/L  (linear variation)
+ */
+export function calculateTrapezoidalLoadVector(
+  L: number,
+  qxStart: number,
+  qyStart: number,
+  qxEnd: number,
+  qyEnd: number
+): number[] {
+  // Superposition: uniform part + triangular part
+  // Uniform: q_uniform = qStart, full span
+  // Triangle: q_tri(x) = (qEnd - qStart) * x/L, from 0 to L
+  //
+  // For transverse (qy):
+  //   Uniform:   Fy1 = qy*L/2,   M1 = qy*L^2/12,   Fy2 = qy*L/2,   M2 = -qy*L^2/12
+  //   Triangle:  Fy1 = 3dqy*L/20, M1 = dqy*L^2/30,  Fy2 = 7dqy*L/20, M2 = -dqy*L^2/20
+  //
+  // For axial (qx):
+  //   Uniform:   Fx1 = qx*L/2,   Fx2 = qx*L/2
+  //   Triangle:  Fx1 = dqx*L/6,  Fx2 = dqx*L/3
+
+  const dqy = qyEnd - qyStart;
+  const dqx = qxEnd - qxStart;
+
+  return [
+    qxStart * L / 2 + dqx * L / 6,                      // Fx1
+    qyStart * L / 2 + 3 * dqy * L / 20,                 // Fy1
+    qyStart * L * L / 12 + dqy * L * L / 30,            // M1
+    qxStart * L / 2 + dqx * L / 3,                      // Fx2
+    qyStart * L / 2 + 7 * dqy * L / 20,                 // Fy2
+    -qyStart * L * L / 12 - dqy * L * L / 20            // M2
+  ];
+}
+
+/**
+ * Calculate equivalent nodal forces for a partial trapezoidal distributed load.
+ * Load varies linearly from qStart at startT to qEnd at endT.
+ * Uses numerical integration with Simpson's rule for accuracy.
+ */
+export function calculatePartialTrapezoidalLoadVector(
+  L: number,
+  qxStart: number,
+  qyStart: number,
+  qxEnd: number,
+  qyEnd: number,
+  startT: number,
+  endT: number
+): number[] {
+  const La = startT * L;
+  const Lb = endT * L;
+  const span = Lb - La;
+  if (span <= 0) return [0, 0, 0, 0, 0, 0];
+
+  // Use 20 Simpson integration intervals
+  const n = 20;
+  const h = span / n;
+
+  // Accumulators for force vector [Fx1, Fy1, M1, Fx2, Fy2, M2]
+  const F = [0, 0, 0, 0, 0, 0];
+
+  for (let i = 0; i <= n; i++) {
+    const x = La + i * h;
+    const t = span > 0 ? (x - La) / span : 0; // parameter 0..1 within loaded region
+    const qy_x = qyStart + (qyEnd - qyStart) * t;
+    const qx_x = qxStart + (qxEnd - qxStart) * t;
+
+    // Hermite shape functions at x
+    const xi = x / L;
+    const N1 = 1 - 3 * xi * xi + 2 * xi * xi * xi;
+    const N2 = x * (1 - xi) * (1 - xi);
+    const N3 = 3 * xi * xi - 2 * xi * xi * xi;
+    const N4 = x * xi * (xi - 1);
+
+    // Linear axial shape functions
+    const L1 = 1 - xi;
+    const L2 = xi;
+
+    // Simpson weight
+    let w: number;
+    if (i === 0 || i === n) w = 1;
+    else if (i % 2 === 1) w = 4;
+    else w = 2;
+
+    F[0] += w * qx_x * L1;  // Fx1
+    F[1] += w * qy_x * N1;  // Fy1
+    F[2] += w * qy_x * N2;  // M1
+    F[3] += w * qx_x * L2;  // Fx2
+    F[4] += w * qy_x * N3;  // Fy2
+    F[5] += w * qy_x * N4;  // M2
+  }
+
+  const factor = h / 3;
+  for (let i = 0; i < 6; i++) {
+    F[i] *= factor;
+  }
+
+  return F;
+}
+
+/**
  * Transform local forces to global coordinates
  */
 export function transformLocalToGlobal(localForces: number[], angle: number): number[] {
@@ -280,35 +382,38 @@ export function transformGlobalToLocal(globalDisp: number[], angle: number): num
 export const DEFAULT_SECTIONS: { name: string; section: IBeamSection }[] = [
   {
     name: 'IPE 100',
-    section: { A: 10.3e-4, I: 171e-8, h: 0.100 }
+    section: { A: 10.3e-4, I: 171e-8, h: 0.100, Iy: 171e-8, Iz: 15.9e-8, Wy: 34.2e-6, Wz: 5.79e-6, Wply: 39.4e-6, Wplz: 9.15e-6 }
   },
   {
     name: 'IPE 200',
-    section: { A: 28.5e-4, I: 1940e-8, h: 0.200 }
+    section: { A: 28.5e-4, I: 1940e-8, h: 0.200, Iy: 1940e-8, Iz: 142e-8, Wy: 194e-6, Wz: 28.5e-6, Wply: 221e-6, Wplz: 44.6e-6 }
   },
   {
     name: 'IPE 300',
-    section: { A: 53.8e-4, I: 8360e-8, h: 0.300 }
+    section: { A: 53.8e-4, I: 8360e-8, h: 0.300, Iy: 8360e-8, Iz: 604e-8, Wy: 557e-6, Wz: 80.5e-6, Wply: 628e-6, Wplz: 125e-6 }
   },
   {
     name: 'HEA 100',
-    section: { A: 21.2e-4, I: 349e-8, h: 0.096 }
+    section: { A: 21.2e-4, I: 349e-8, h: 0.096, Iy: 349e-8, Iz: 134e-8, Wy: 72.8e-6, Wz: 26.8e-6, Wply: 83.0e-6, Wplz: 41.1e-6 }
   },
   {
     name: 'HEA 200',
-    section: { A: 53.8e-4, I: 3690e-8, h: 0.190 }
+    section: { A: 53.8e-4, I: 3690e-8, h: 0.190, Iy: 3690e-8, Iz: 1340e-8, Wy: 389e-6, Wz: 134e-6, Wply: 430e-6, Wplz: 204e-6 }
   },
   {
+    // b=100mm, h=200mm: Iy=bh³/12, Iz=hb³/12, Wy=bh²/6, Wz=hb²/6, Wply=bh²/4, Wplz=hb²/4
     name: 'Rectangle 100x200',
-    section: { A: 0.02, I: 6.667e-5, h: 0.200 }  // b=100mm, h=200mm
+    section: { A: 0.02, I: 6.667e-5, h: 0.200, Iy: 6.667e-5, Iz: 1.667e-5, Wy: 6.667e-4, Wz: 3.333e-4, Wply: 1.0e-3, Wplz: 5.0e-4 }
   },
   {
+    // b=200mm, h=400mm
     name: 'Rectangle 200x400',
-    section: { A: 0.08, I: 1.067e-3, h: 0.400 }  // b=200mm, h=400mm
+    section: { A: 0.08, I: 1.067e-3, h: 0.400, Iy: 1.067e-3, Iz: 2.667e-4, Wy: 5.333e-3, Wz: 2.667e-3, Wply: 8.0e-3, Wplz: 4.0e-3 }
   },
   {
+    // D=100mm, t=5mm → d=90mm; Iy=Iz=π(D⁴-d⁴)/64, Wy=Wz=π(D⁴-d⁴)/(32D)
     name: 'Tube 100x5',
-    section: { A: 14.92e-4, I: 168e-8, h: 0.100 }  // D=100mm, t=5mm
+    section: { A: 14.92e-4, I: 168e-8, h: 0.100, Iy: 168e-8, Iz: 168e-8, Wy: 33.6e-6, Wz: 33.6e-6, Wply: 44.3e-6, Wplz: 44.3e-6 }
   }
 ];
 
@@ -316,10 +421,18 @@ export const DEFAULT_SECTIONS: { name: string; section: IBeamSection }[] = [
  * Calculate section properties for rectangular section
  */
 export function rectangularSection(b: number, h: number): IBeamSection {
+  const Iy = b * h * h * h / 12;
+  const Iz = h * b * b * b / 12;
   return {
     A: b * h,
-    I: b * h * h * h / 12,
-    h: h
+    I: Iy,
+    h: h,
+    Iy,
+    Iz,
+    Wy: b * h * h / 6,
+    Wz: h * b * b / 6,
+    Wply: b * h * h / 4,
+    Wplz: h * b * b / 4,
   };
 }
 
@@ -329,10 +442,20 @@ export function rectangularSection(b: number, h: number): IBeamSection {
 export function tubularSection(D: number, t: number): IBeamSection {
   const r_outer = D / 2;
   const r_inner = r_outer - t;
+  const Iy = Math.PI / 4 * (Math.pow(r_outer, 4) - Math.pow(r_inner, 4));
+  const Wy = Iy / r_outer;
+  // Plastic section modulus for hollow circular tube
+  const Wply = (4 / 3) * (Math.pow(r_outer, 3) - Math.pow(r_inner, 3));
   return {
     A: Math.PI * (r_outer * r_outer - r_inner * r_inner),
-    I: Math.PI / 4 * (Math.pow(r_outer, 4) - Math.pow(r_inner, 4)),
-    h: D
+    I: Iy,
+    h: D,
+    Iy,
+    Iz: Iy,     // Symmetric: Iz = Iy for circular tube
+    Wy,
+    Wz: Wy,     // Symmetric
+    Wply,
+    Wplz: Wply,  // Symmetric
   };
 }
 
@@ -349,9 +472,31 @@ export function iProfileSection(h: number, b: number, tw: number, tf: number): I
   const d = (h - tf) / 2; // distance from centroid to flange centroid
   const If = 2 * (b * Math.pow(tf, 3) / 12 + b * tf * d * d);
 
+  const A = Aw + Af;
+  const Iy = Iw + If;
+
+  // Weak axis: Iz = 2*(tf*b³/12) + (h-2*tf)*tw³/12
+  const Iz = 2 * (tf * Math.pow(b, 3) / 12) + (h - 2 * tf) * Math.pow(tw, 3) / 12;
+
+  // Elastic section moduli
+  const Wy = Iy / (h / 2);
+  const Wz = Iz / (b / 2);
+
+  // Plastic section moduli (approximate)
+  // Strong axis: Wply = b*tf*(h-tf) + tw*(h-2*tf)²/4
+  const Wply = b * tf * (h - tf) + tw * Math.pow(h - 2 * tf, 2) / 4;
+  // Weak axis: Wplz = 2*tf*b²/4 + (h-2*tf)*tw²/4
+  const Wplz = tf * b * b / 2 + (h - 2 * tf) * tw * tw / 4;
+
   return {
-    A: Aw + Af,
-    I: Iw + If,
-    h: h
+    A,
+    I: Iy,
+    h,
+    Iy,
+    Iz,
+    Wy,
+    Wz,
+    Wply,
+    Wplz,
   };
 }

@@ -12,6 +12,7 @@ export interface IPointLoad {
 }
 
 export interface IDistributedLoad {
+  id?: number;     // Unique identifier within a load case (auto-generated)
   elementId: number;
   qx: number;      // N/m (local) — at start (or uniform)
   qy: number;      // N/m (local) — at start (or uniform)
@@ -20,6 +21,7 @@ export interface IDistributedLoad {
   startT?: number;  // Partial load start position (0-1), default 0
   endT?: number;    // Partial load end position (0-1), default 1
   coordSystem?: 'local' | 'global'; // Load direction, default 'local'
+  description?: string;  // User-defined label (e.g. "Self-weight", "Wind pressure")
 }
 
 export interface ILoadCase {

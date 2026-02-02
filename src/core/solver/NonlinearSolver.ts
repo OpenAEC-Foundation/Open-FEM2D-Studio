@@ -12,11 +12,15 @@ import {
   calculateBeamLength,
   calculateBeamAngle,
   calculateBeamLocalStiffness,
-  createTransformationMatrix
+  createTransformationMatrix,
+  calculateTrapezoidalLoadVector,
+  calculatePartialTrapezoidalLoadVector,
+  calculatePartialDistributedLoadVector,
 } from '../fem/Beam';
 import { calculateBeamInternalForces } from '../fem/BeamForces';
 import { calculateElementStress, calculatePrincipalStresses } from '../fem/Triangle';
-import { calculateElementMoments } from '../fem/DKT';
+import { calculateQuadStress } from '../fem/Quad4';
+import { calculateElementMoments, calculateElementShearForces } from '../fem/DKT';
 import { assembleGlobalStiffnessMatrix, assembleForceVector as assembleForceVectorNew, getConstrainedDofs, getDofsPerNode } from './Assembler';
 import { solveLinearSystem } from '../math/GaussElimination';
 
@@ -196,18 +200,49 @@ function assembleForceVector(mesh: Mesh): number[] {
     const L = calculateBeamLength(n1, n2);
     const angle = calculateBeamAngle(n1, n2);
 
-    const qx = beam.distributedLoad.qx;
-    const qy = beam.distributedLoad.qy;
+    let qx = beam.distributedLoad.qx;
+    let qy = beam.distributedLoad.qy;
+    let qxE = beam.distributedLoad.qxEnd ?? qx;
+    let qyE = beam.distributedLoad.qyEnd ?? qy;
+    const coordSystem = beam.distributedLoad.coordSystem ?? 'local';
+    const startT = beam.distributedLoad.startT ?? 0;
+    const endT = beam.distributedLoad.endT ?? 1;
+
+    // If global coordinate system, project to local axes
+    if (coordSystem === 'global') {
+      const cos = Math.cos(angle);
+      const sin = Math.sin(angle);
+      const qxLocal = qx * cos + qy * sin;
+      const qyLocal = -qx * sin + qy * cos;
+      const qxELocal = qxE * cos + qyE * sin;
+      const qyELocal = -qxE * sin + qyE * cos;
+      qx = qxLocal;
+      qy = qyLocal;
+      qxE = qxELocal;
+      qyE = qyELocal;
+    }
 
     // Equivalent nodal forces in local coordinates
-    const fLocal = [
-      qx * L / 2,
-      qy * L / 2,
-      qy * L * L / 12,
-      qx * L / 2,
-      qy * L / 2,
-      -qy * L * L / 12
-    ];
+    const isTrapezoidal = qxE !== qx || qyE !== qy;
+    let fLocal: number[];
+    if (isTrapezoidal) {
+      if (startT > 0 || endT < 1) {
+        fLocal = calculatePartialTrapezoidalLoadVector(L, qx, qy, qxE, qyE, startT, endT);
+      } else {
+        fLocal = calculateTrapezoidalLoadVector(L, qx, qy, qxE, qyE);
+      }
+    } else if (startT > 0 || endT < 1) {
+      fLocal = calculatePartialDistributedLoadVector(L, qx, qy, startT, endT);
+    } else {
+      fLocal = [
+        qx * L / 2,
+        qy * L / 2,
+        qy * L * L / 12,
+        qx * L / 2,
+        qy * L / 2,
+        -qy * L * L / 12
+      ];
+    }
 
     // Transform to global
     const T = createTransformationMatrix(angle);
@@ -338,8 +373,17 @@ export function solveNonlinear(
   const opts = { ...DEFAULT_OPTIONS, ...options };
 
   // For plate-related analyses, delegate to the Assembler-based path
+  // But if there are no plate/triangle elements, fall back to frame analysis for beams
   if (opts.analysisType === 'plate_bending' || opts.analysisType === 'plane_stress' || opts.analysisType === 'plane_strain') {
-    return solvePlateOrPlane(mesh, opts);
+    if (mesh.elements.size > 0) {
+      return solvePlateOrPlane(mesh, opts);
+    }
+    // No plate elements — fall back to frame if there are beams
+    if (mesh.getBeamCount() > 0) {
+      opts.analysisType = 'frame';
+    } else {
+      throw new Error('Model must have plate elements for this analysis type, or beams for frame analysis');
+    }
   }
 
   // Validate frame analysis
@@ -478,7 +522,7 @@ function solvePlateOrPlane(
 
   // Validate
   if (mesh.elements.size < 1) {
-    throw new Error('Model must have at least 1 triangle element');
+    throw new Error('Model must have at least 1 plate element');
   }
 
   let hasConstraints = false;
@@ -527,14 +571,27 @@ function solvePlateOrPlane(
   let maxMoment = -Infinity;
   let minMoment = Infinity;
 
+  // Per-component range tracking
+  const ranges = {
+    sigmaX: { min: Infinity, max: -Infinity },
+    sigmaY: { min: Infinity, max: -Infinity },
+    tauXY: { min: Infinity, max: -Infinity },
+    mx: { min: Infinity, max: -Infinity },
+    my: { min: Infinity, max: -Infinity },
+    mxy: { min: Infinity, max: -Infinity },
+    vx: { min: Infinity, max: -Infinity },
+    vy: { min: Infinity, max: -Infinity },
+    nx: { min: Infinity, max: -Infinity },
+    ny: { min: Infinity, max: -Infinity },
+    nxy: { min: Infinity, max: -Infinity },
+  };
+
   for (const element of mesh.elements.values()) {
     const nodes = mesh.getElementNodes(element);
-    if (nodes.length !== 3) continue;
+    if (nodes.length < 3 || nodes.length > 4) continue;
 
     const material = mesh.getMaterial(element.materialId);
     if (!material) continue;
-
-    const [n1, n2, n3] = nodes;
 
     // Extract element displacements
     const elemDisp: number[] = [];
@@ -547,8 +604,13 @@ function solvePlateOrPlane(
     }
 
     if (analysisType === 'plate_bending') {
+      // DKT plate bending only supports triangles (backward compat)
+      if (nodes.length !== 3) continue;
+      const [n1, n2, n3] = nodes;
       // Calculate moments
       const moments = calculateElementMoments(n1, n2, n3, material, element.thickness, elemDisp);
+      // Calculate transverse shear forces
+      const shear = calculateElementShearForces(n1, n2, n3, material, element.thickness, elemDisp);
       const stress: IElementStress = {
         elementId: element.id,
         sigmaX: 0,
@@ -559,28 +621,81 @@ function solvePlateOrPlane(
         mx: moments.mx,
         my: moments.my,
         mxy: moments.mxy,
+        vx: shear.vx,
+        vy: shear.vy,
       };
       elementStresses.set(element.id, stress);
 
       maxMoment = Math.max(maxMoment, moments.mx, moments.my, moments.mxy);
       minMoment = Math.min(minMoment, moments.mx, moments.my, moments.mxy);
+
+      // Track per-component ranges
+      ranges.mx.min = Math.min(ranges.mx.min, moments.mx);
+      ranges.mx.max = Math.max(ranges.mx.max, moments.mx);
+      ranges.my.min = Math.min(ranges.my.min, moments.my);
+      ranges.my.max = Math.max(ranges.my.max, moments.my);
+      ranges.mxy.min = Math.min(ranges.mxy.min, moments.mxy);
+      ranges.mxy.max = Math.max(ranges.mxy.max, moments.mxy);
+      ranges.vx.min = Math.min(ranges.vx.min, shear.vx);
+      ranges.vx.max = Math.max(ranges.vx.max, shear.vx);
+      ranges.vy.min = Math.min(ranges.vy.min, shear.vy);
+      ranges.vy.max = Math.max(ranges.vy.max, shear.vy);
     } else {
-      // Plane stress/strain
-      const stress = calculateElementStress(n1, n2, n3, material, elemDisp, analysisType);
+      // Plane stress/strain — handle both quad and triangle elements
+      let stress: { sigmaX: number; sigmaY: number; tauXY: number; vonMises: number };
+
+      if (nodes.length === 4) {
+        const [n1, n2, n3, n4] = nodes;
+        stress = calculateQuadStress(n1, n2, n3, n4, material, elemDisp, analysisType);
+      } else {
+        const [n1, n2, n3] = nodes;
+        stress = calculateElementStress(n1, n2, n3, material, elemDisp, analysisType);
+      }
+
       const principal = calculatePrincipalStresses(stress.sigmaX, stress.sigmaY, stress.tauXY);
+
+      // Membrane forces: N = stress x thickness (N/m)
+      const thickness = element.thickness || 1;
+      const nx = stress.sigmaX * thickness;
+      const ny = stress.sigmaY * thickness;
+      const nxy = stress.tauXY * thickness;
+
       elementStresses.set(element.id, {
         elementId: element.id,
         ...stress,
         principalStresses: principal,
+        nx,
+        ny,
+        nxy,
       });
       maxVonMises = Math.max(maxVonMises, stress.vonMises);
       minVonMises = Math.min(minVonMises, stress.vonMises);
+
+      // Track per-component ranges
+      ranges.sigmaX.min = Math.min(ranges.sigmaX.min, stress.sigmaX);
+      ranges.sigmaX.max = Math.max(ranges.sigmaX.max, stress.sigmaX);
+      ranges.sigmaY.min = Math.min(ranges.sigmaY.min, stress.sigmaY);
+      ranges.sigmaY.max = Math.max(ranges.sigmaY.max, stress.sigmaY);
+      ranges.tauXY.min = Math.min(ranges.tauXY.min, stress.tauXY);
+      ranges.tauXY.max = Math.max(ranges.tauXY.max, stress.tauXY);
+      ranges.nx.min = Math.min(ranges.nx.min, nx);
+      ranges.nx.max = Math.max(ranges.nx.max, nx);
+      ranges.ny.min = Math.min(ranges.ny.min, ny);
+      ranges.ny.max = Math.max(ranges.ny.max, ny);
+      ranges.nxy.min = Math.min(ranges.nxy.min, nxy);
+      ranges.nxy.max = Math.max(ranges.nxy.max, nxy);
     }
   }
 
   if (minVonMises === Infinity) minVonMises = 0;
   if (maxMoment === -Infinity) maxMoment = 0;
   if (minMoment === Infinity) minMoment = 0;
+
+  // Finalize ranges (replace Infinity with 0 for unused components)
+  for (const key of Object.keys(ranges) as (keyof typeof ranges)[]) {
+    if (ranges[key].min === Infinity) ranges[key].min = 0;
+    if (ranges[key].max === -Infinity) ranges[key].max = 0;
+  }
 
   return {
     displacements,
@@ -591,5 +706,6 @@ function solvePlateOrPlane(
     minVonMises,
     maxMoment: analysisType === 'plate_bending' ? maxMoment : undefined,
     minMoment: analysisType === 'plate_bending' ? minMoment : undefined,
+    stressRanges: ranges,
   };
 }

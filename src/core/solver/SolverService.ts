@@ -91,6 +91,8 @@ function meshToSolverPayload(mesh: Mesh, options: SolveOptions) {
       beam.distributedLoad = {
         qx: b.distributedLoad.qx,
         qy: b.distributedLoad.qy,
+        qxEnd: b.distributedLoad.qxEnd ?? b.distributedLoad.qx,
+        qyEnd: b.distributedLoad.qyEnd ?? b.distributedLoad.qy,
         startT: b.distributedLoad.startT ?? 0,
         endT: b.distributedLoad.endT ?? 1,
         coordSystem: b.distributedLoad.coordSystem ?? 'local',

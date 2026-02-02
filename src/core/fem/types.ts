@@ -36,10 +36,25 @@ export interface ITriangleElement extends IElement {
   nodeIds: [number, number, number];
 }
 
+export interface IQuadElement extends IElement {
+  nodeIds: [number, number, number, number];
+}
+
 export interface IBeamSection {
   A: number;          // Cross-sectional area (m²)
-  I: number;          // Second moment of area (m⁴)
+  I: number;          // Second moment of area about strong axis Iy (m⁴) - keep for backward compat
   h: number;          // Height of section (m) - for stress calculation
+  b?: number;         // Flange width (m)
+  tw?: number;        // Web thickness (m)
+  tf?: number;        // Flange thickness (m)
+  Iy?: number;        // Second moment of area, strong axis (m⁴) - same as I
+  Iz?: number;        // Second moment of area, weak axis (m⁴)
+  Wy?: number;        // Elastic section modulus, strong axis (m³)
+  Wz?: number;        // Elastic section modulus, weak axis (m³)
+  Wply?: number;      // Plastic section modulus, strong axis (m³)
+  Wplz?: number;      // Plastic section modulus, weak axis (m³)
+  It?: number;        // Torsional constant (m⁴)
+  Iw?: number;        // Warping constant (m⁶)
 }
 
 // Point load on beam (at a specific position along the beam)
@@ -85,26 +100,34 @@ export interface IPlateEdge {
 
 export interface IPlateRegion {
   id: number;
-  x: number; y: number;           // bottom-left corner (world)
-  width: number; height: number;   // dimensions (meters)
-  divisionsX: number;              // mesh divisions in X
-  divisionsY: number;              // mesh divisions in Y
+  x: number; y: number;           // bottom-left corner (world) / bounding box origin
+  width: number; height: number;   // dimensions (meters) / bounding box size
+  divisionsX: number;              // mesh divisions in X (rectangular mode)
+  divisionsY: number;              // mesh divisions in Y (rectangular mode)
   materialId: number;
   thickness: number;               // plate thickness (meters)
+  elementType?: 'triangle' | 'quad'; // element type (default: quad)
   nodeIds: number[];               // all generated node IDs
   cornerNodeIds: [number, number, number, number]; // BL, BR, TR, TL
-  elementIds: number[];            // all generated triangle element IDs
+  elementIds: number[];            // all generated element IDs (triangles or quads)
   edges: {
     bottom: IPlateEdge;
     top: IPlateEdge;
     left: IPlateEdge;
     right: IPlateEdge;
   };
+  // Polygon plate fields (optional — rectangular plates omit these)
+  isPolygon?: boolean;
+  polygon?: { x: number; y: number }[];
+  voids?: { x: number; y: number }[][];
+  maxArea?: number;
+  meshSize?: number;               // element edge length for polygon quad mesh (meters)
+  boundaryNodeIds?: number[];
 }
 
 export interface IEdgeLoad {
   plateId: number;
-  edge: 'top' | 'bottom' | 'left' | 'right';
+  edge: 'top' | 'bottom' | 'left' | 'right' | number;  // number = polygon edge index (0-based)
   px: number;  // N/m global X
   py: number;  // N/m global Y
 }
@@ -115,7 +138,28 @@ export interface IThermalLoad {
   deltaT: number;      // temperature change (°C)
 }
 
-export type ElementType = 'triangle' | 'beam';
+export interface IEnvelopeResult {
+  minDisplacements: number[];
+  maxDisplacements: number[];
+  beamForces: Map<number, {
+    minN: number[]; maxN: number[];
+    minV: number[]; maxV: number[];
+    minM: number[]; maxM: number[];
+    stations: number[];
+  }>;
+}
+
+export interface ISubNode {
+  id: number;
+  beamId: number;      // The original beam this sub-node was placed on (before split)
+  t: number;           // Parameter 0-1 along original beam length
+  nodeId: number;      // The actual mesh node ID created for this sub-node
+  originalBeamStart: number;  // Original beam start node ID
+  originalBeamEnd: number;    // Original beam end node ID
+  childBeamIds: [number, number]; // The two beam segments created by the split
+}
+
+export type ElementType = 'triangle' | 'quad' | 'beam';
 
 export interface IMesh {
   nodes: Map<number, INode>;
@@ -132,6 +176,20 @@ export interface ISolverResult {
   minVonMises: number;
   maxMoment?: number;               // For plate bending color scale
   minMoment?: number;
+  // Per-component min/max for stress contour scaling
+  stressRanges?: {
+    sigmaX: { min: number; max: number };
+    sigmaY: { min: number; max: number };
+    tauXY: { min: number; max: number };
+    mx: { min: number; max: number };
+    my: { min: number; max: number };
+    mxy: { min: number; max: number };
+    vx: { min: number; max: number };
+    vy: { min: number; max: number };
+    nx: { min: number; max: number };
+    ny: { min: number; max: number };
+    nxy: { min: number; max: number };
+  };
 }
 
 export interface IBeamForces {
@@ -166,9 +224,15 @@ export interface IElementStress {
     sigma2: number;
     angle: number;
   };
-  mx?: number;      // Bending moment per unit length (plate bending)
+  mx?: number;      // Bending moment per unit length (plate bending) [Nm/m]
   my?: number;
   mxy?: number;
+  vx?: number;      // Transverse shear force per unit length [N/m]
+  vy?: number;
+  // Membrane forces (N/m) = stress × thickness
+  nx?: number;
+  ny?: number;
+  nxy?: number;
 }
 
 export type AnalysisType = 'plane_stress' | 'plane_strain' | 'frame' | 'plate_bending';
@@ -182,7 +246,7 @@ export type Tool = 'select' | 'addNode' | 'addSubNode' | 'addElement' | 'addBeam
   | 'addPinned' | 'addXRoller' | 'addZRoller' | 'addZSpring' | 'addRotSpring' | 'addXSpring' | 'addFixed'
   | 'addLineLoad' | 'addPlate' | 'addEdgeLoad' | 'addThermalLoad';
 
-export type StressType = 'vonMises' | 'sigmaX' | 'sigmaY' | 'tauXY' | 'mx' | 'my' | 'mxy';
+export type StressType = 'vonMises' | 'sigmaX' | 'sigmaY' | 'tauXY' | 'mx' | 'my' | 'mxy' | 'vx' | 'vy' | 'nx' | 'ny' | 'nxy';
 
 export interface IViewState {
   offsetX: number;
@@ -195,5 +259,6 @@ export interface ISelection {
   elementIds: Set<number>;
   pointLoadNodeIds: Set<number>;    // nodes with selected point load
   distLoadBeamIds: Set<number>;     // beams with selected distributed load
+  selectedDistLoadIds: Set<number>; // individual distributed load IDs (from IDistributedLoad.id)
   plateIds: Set<number>;            // selected plate regions
 }

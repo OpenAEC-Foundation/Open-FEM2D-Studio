@@ -136,6 +136,52 @@
   border-color: var(--accent);
 }
 
+/* Concrete-specific fields */
+.section-concrete-fields {
+  display: flex;
+  flex-direction: column;
+  max-height: 180px;
+  overflow-y: auto;
+  border-bottom: 1px solid var(--border);
+}
+
+.section-concrete-group {
+  border-top: 1px solid var(--border);
+}
+
+.section-concrete-group-title {
+  padding: 4px 12px;
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  background: var(--bg-secondary);
+}
+
+.section-grade-input {
+  flex: 1;
+  padding: 4px 8px;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-light);
+  border-radius: 4px;
+  color: var(--text-primary);
+  font-size: 11px;
+  font-family: monospace;
+  max-width: 140px;
+}
+
+.section-grade-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.section-grade-input::placeholder {
+  color: var(--text-muted);
+  font-size: 10px;
+  font-family: inherit;
+}
+
 /* Two-column layout */
 .section-two-column {
   display: flex;
@@ -245,6 +291,34 @@
   display: flex;
   flex-direction: column;
   gap: 10px;
+  overflow-y: auto;
+  flex: 1;
+}
+
+.section-custom-form select {
+  flex: 1;
+  padding: 4px 8px;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-light);
+  border-radius: 4px;
+  color: var(--text-primary);
+  font-size: 12px;
+}
+
+.section-custom-form select:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.section-custom-divider {
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+  padding-top: 8px;
+  margin-top: 4px;
+  border-top: 1px solid var(--border);
 }
 
 .section-custom-form label {

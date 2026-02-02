@@ -1,6 +1,6 @@
 import React, { createContext, useContext, useReducer, useCallback, ReactNode } from 'react';
 import { Mesh } from '../core/fem/Mesh';
-import { ISolverResult, Tool, IViewState, ISelection, AnalysisType, StressType } from '../core/fem/types';
+import { INode, IBeamElement, ISolverResult, IEnvelopeResult, Tool, IViewState, ISelection, AnalysisType, StressType } from '../core/fem/types';
 import { ILoadCase, ILoadCombination } from '../core/fem/LoadCase';
 import { convertEdgeLoadToNodalForces } from '../core/fem/PlateRegion';
 import { IStructuralGrid } from '../core/fem/StructuralGrid';
@@ -10,12 +10,15 @@ export type ViewMode = 'geometry' | 'loads' | 'results' | '3d';
 
 export interface IProjectInfo {
   name: string;
+  projectNumber: string;
   engineer: string;
   company: string;
   date: string;
   description: string;
   notes: string;
   location: string;
+  latitude?: number;
+  longitude?: number;
 }
 
 interface FEMState {
@@ -60,6 +63,9 @@ interface FEMState {
   activeCombination: number | null;
   // Envelope results (min/max across all combinations)
   showEnvelope: boolean;
+  envelopeResult: IEnvelopeResult | null;
+  // Show displacement values at nodes in results view
+  showDisplacements: boolean;
   // Auto-recalculate
   autoRecalculate: boolean;
   // Canvas refresh counter
@@ -74,8 +80,18 @@ interface FEMState {
   projectInfo: IProjectInfo;
   // Structural grid
   structuralGrid: IStructuralGrid;
+  // Deflection diagram toggle
+  showDeflections: boolean;
   // Code-check: beam ID for which to show the steel check report
   codeCheckBeamId: number | null;
+  // Clipboard for copy/paste
+  clipboard: { nodes: INode[]; beamElements: IBeamElement[] } | null;
+  // Mouse world position for status bar display
+  mouseWorldPos: { x: number; y: number } | null;
+  // Canvas size for zoom-to-fit calculations
+  canvasSize: { width: number; height: number };
+  // Solver error message (shown in status bar)
+  solverError: string | null;
 }
 
 type FEMAction =
@@ -112,6 +128,7 @@ type FEMAction =
   | { type: 'SET_ACTIVE_LOAD_CASE'; payload: number }
   | { type: 'SET_SHOW_PROFILE_NAMES'; payload: boolean }
   | { type: 'SET_SHOW_REACTIONS'; payload: boolean }
+  | { type: 'SET_SHOW_DISPLACEMENTS'; payload: boolean }
   | { type: 'SET_SHOW_DIMENSIONS'; payload: boolean }
   | { type: 'UNDO' }
   | { type: 'REDO' }
@@ -120,12 +137,15 @@ type FEMAction =
   | { type: 'SET_LOAD_COMBINATIONS'; payload: ILoadCombination[] }
   | { type: 'SET_ACTIVE_COMBINATION'; payload: number | null }
   | { type: 'ADD_POINT_LOAD'; payload: { lcId: number; nodeId: number; fx: number; fy: number; mz: number } }
-  | { type: 'ADD_DISTRIBUTED_LOAD'; payload: { lcId: number; beamId: number; qx: number; qy: number; qxEnd?: number; qyEnd?: number; startT?: number; endT?: number; coordSystem?: 'local' | 'global' } }
+  | { type: 'ADD_DISTRIBUTED_LOAD'; payload: { lcId: number; beamId: number; qx: number; qy: number; qxEnd?: number; qyEnd?: number; startT?: number; endT?: number; coordSystem?: 'local' | 'global'; description?: string } }
+  | { type: 'UPDATE_DISTRIBUTED_LOAD'; payload: { lcId: number; loadId: number; qx: number; qy: number; qxEnd?: number; qyEnd?: number; startT?: number; endT?: number; coordSystem?: 'local' | 'global'; description?: string } }
   | { type: 'REMOVE_POINT_LOAD'; payload: { lcId: number; nodeId: number } }
-  | { type: 'REMOVE_DISTRIBUTED_LOAD'; payload: { lcId: number; beamId: number } }
+  | { type: 'REMOVE_DISTRIBUTED_LOAD'; payload: { lcId: number; loadId: number } }
+  | { type: 'SELECT_INDIVIDUAL_DIST_LOAD'; payload: number }
+  | { type: 'DESELECT_INDIVIDUAL_DIST_LOAD'; payload: number }
   | { type: 'SELECT_PLATE'; payload: number }
   | { type: 'DESELECT_PLATE'; payload: number }
-  | { type: 'ADD_EDGE_LOAD'; payload: { lcId: number; plateId: number; edge: 'top' | 'bottom' | 'left' | 'right'; px: number; py: number } }
+  | { type: 'ADD_EDGE_LOAD'; payload: { lcId: number; plateId: number; edge: 'top' | 'bottom' | 'left' | 'right' | number; px: number; py: number } }
   | { type: 'REMOVE_EDGE_LOAD'; payload: { lcId: number; plateId: number; edge: string } }
   | { type: 'ADD_THERMAL_LOAD'; payload: { lcId: number; elementId: number; plateId?: number; deltaT: number } }
   | { type: 'REMOVE_THERMAL_LOAD'; payload: { lcId: number; elementId: number } }
@@ -144,8 +164,15 @@ type FEMAction =
   | { type: 'SET_DISPLACEMENT_UNIT'; payload: 'mm' | 'm' }
   | { type: 'SET_AUTO_RECALCULATE'; payload: boolean }
   | { type: 'SET_SHOW_ENVELOPE'; payload: boolean }
+  | { type: 'SET_ENVELOPE_RESULT'; payload: IEnvelopeResult | null }
+  | { type: 'SET_SHOW_DEFLECTIONS'; payload: boolean }
   | { type: 'SET_CODE_CHECK_BEAM'; payload: number | null }
-  | { type: 'CLEANUP_PLATE_LOADS'; payload: { plateId: number; elementIds: number[] } };
+  | { type: 'CLEANUP_PLATE_LOADS'; payload: { plateId: number; elementIds: number[] } }
+  | { type: 'COPY_SELECTED' }
+  | { type: 'PASTE'; payload?: { offsetX: number; offsetY: number } }
+  | { type: 'SET_MOUSE_WORLD_POS'; payload: { x: number; y: number } | null }
+  | { type: 'SET_CANVAS_SIZE'; payload: { width: number; height: number } }
+  | { type: 'SET_SOLVER_ERROR'; payload: string | null };
 
 function createEmptySelection(): ISelection {
   return {
@@ -153,6 +180,7 @@ function createEmptySelection(): ISelection {
     elementIds: new Set(),
     pointLoadNodeIds: new Set(),
     distLoadBeamIds: new Set(),
+    selectedDistLoadIds: new Set(),
     plateIds: new Set()
   };
 }
@@ -239,8 +267,23 @@ function serializeLoadCases(loadCases: ILoadCase[]): object[] {
   return loadCases.map(lc => ({ ...lc }));
 }
 
+function migrateDistributedLoadIds(lcs: ILoadCase[]): void {
+  for (const lc of lcs) {
+    if (!lc.distributedLoads) continue;
+    let maxId = 0;
+    for (const dl of lc.distributedLoads) {
+      if (dl.id != null && dl.id > maxId) maxId = dl.id;
+    }
+    for (const dl of lc.distributedLoads) {
+      if (dl.id == null) dl.id = ++maxId;
+    }
+  }
+}
+
 function deserializeLoadCases(data: object[]): ILoadCase[] {
-  return data as ILoadCase[];
+  const lcs = data as ILoadCase[];
+  migrateDistributedLoadIds(lcs);
+  return lcs;
 }
 
 // Helper: apply a load case's loads onto the mesh (for solving)
@@ -268,21 +311,37 @@ export function applyLoadCaseToMesh(mesh: Mesh, loadCase: ILoadCase): void {
     }
   }
 
-  // Apply distributed loads from load case
+  // Apply distributed loads from load case (combine multiple loads per beam additively)
   for (const dl of loadCase.distributedLoads) {
     const beam = mesh.getBeamElement(dl.elementId);
     if (beam) {
-      mesh.updateBeamElement(dl.elementId, {
-        distributedLoad: {
-          qx: dl.qx,
-          qy: dl.qy,
-          qxEnd: dl.qxEnd,
-          qyEnd: dl.qyEnd,
-          startT: dl.startT,
-          endT: dl.endT,
-          coordSystem: dl.coordSystem
-        }
-      });
+      const existing = beam.distributedLoad;
+      if (existing) {
+        // Combine additively with existing load on this beam
+        mesh.updateBeamElement(dl.elementId, {
+          distributedLoad: {
+            qx: existing.qx + dl.qx,
+            qy: existing.qy + dl.qy,
+            qxEnd: (existing.qxEnd ?? existing.qx) + (dl.qxEnd ?? dl.qx),
+            qyEnd: (existing.qyEnd ?? existing.qy) + (dl.qyEnd ?? dl.qy),
+            startT: Math.min(existing.startT ?? 0, dl.startT ?? 0),
+            endT: Math.max(existing.endT ?? 1, dl.endT ?? 1),
+            coordSystem: dl.coordSystem ?? existing.coordSystem
+          }
+        });
+      } else {
+        mesh.updateBeamElement(dl.elementId, {
+          distributedLoad: {
+            qx: dl.qx,
+            qy: dl.qy,
+            qxEnd: dl.qxEnd,
+            qyEnd: dl.qyEnd,
+            startT: dl.startT,
+            endT: dl.endT,
+            coordSystem: dl.coordSystem
+          }
+        });
+      }
     }
   }
 
@@ -436,6 +495,7 @@ const initialState: FEMState = {
   activeLoadCase: 1,
   showProfileNames: false,
   showReactions: true,
+  showDisplacements: false,
   showDimensions: true,
   showNodes: true,
   showMembers: true,
@@ -447,6 +507,7 @@ const initialState: FEMState = {
   displacementUnit: 'mm',
   activeCombination: null,
   showEnvelope: false,
+  envelopeResult: null,
   autoRecalculate: true,
   meshVersion: 0,
   undoStack: [],
@@ -455,6 +516,7 @@ const initialState: FEMState = {
   loadCombinations: createDefaultCombinations(),
   projectInfo: {
     name: 'Untitled Project',
+    projectNumber: '',
     engineer: '',
     company: '',
     date: new Date().toISOString().slice(0, 10),
@@ -463,7 +525,12 @@ const initialState: FEMState = {
     location: ''
   },
   structuralGrid: createDefaultStructuralGrid(),
-  codeCheckBeamId: null
+  showDeflections: false,
+  codeCheckBeamId: null,
+  clipboard: null,
+  mouseWorldPos: null,
+  canvasSize: { width: 800, height: 600 },
+  solverError: null
 };
 
 // Apply demo load case loads to mesh so they render on first load
@@ -475,7 +542,10 @@ function femReducer(state: FEMState, action: FEMAction): FEMState {
       return { ...state, mesh: action.payload, result: null };
 
     case 'SET_RESULT':
-      return { ...state, result: action.payload };
+      return { ...state, result: action.payload, solverError: null };
+
+    case 'SET_SOLVER_ERROR':
+      return { ...state, solverError: action.payload };
 
     case 'SET_TOOL':
       return { ...state, selectedTool: action.payload, pendingNodes: [] };
@@ -488,6 +558,7 @@ function femReducer(state: FEMState, action: FEMAction): FEMState {
           elementIds: action.payload.elementIds ?? new Set(),
           pointLoadNodeIds: action.payload.pointLoadNodeIds ?? new Set(),
           distLoadBeamIds: action.payload.distLoadBeamIds ?? new Set(),
+          selectedDistLoadIds: action.payload.selectedDistLoadIds ?? new Set(),
           plateIds: action.payload.plateIds ?? new Set()
         }
       };
@@ -541,6 +612,18 @@ function femReducer(state: FEMState, action: FEMAction): FEMState {
       const newIds = new Set(state.selection.distLoadBeamIds);
       newIds.delete(action.payload);
       return { ...state, selection: { ...state.selection, distLoadBeamIds: newIds } };
+    }
+
+    case 'SELECT_INDIVIDUAL_DIST_LOAD': {
+      const newIds = new Set(state.selection.selectedDistLoadIds);
+      newIds.add(action.payload);
+      return { ...state, selection: { ...state.selection, selectedDistLoadIds: newIds } };
+    }
+
+    case 'DESELECT_INDIVIDUAL_DIST_LOAD': {
+      const newIds = new Set(state.selection.selectedDistLoadIds);
+      newIds.delete(action.payload);
+      return { ...state, selection: { ...state.selection, selectedDistLoadIds: newIds } };
     }
 
     case 'SET_VIEW_STATE':
@@ -602,6 +685,9 @@ function femReducer(state: FEMState, action: FEMAction): FEMState {
 
     case 'SET_SHOW_REACTIONS':
       return { ...state, showReactions: action.payload };
+
+    case 'SET_SHOW_DISPLACEMENTS':
+      return { ...state, showDisplacements: action.payload };
 
     case 'SET_SHOW_DIMENSIONS':
       return { ...state, showDimensions: action.payload };
@@ -685,14 +771,30 @@ function femReducer(state: FEMState, action: FEMAction): FEMState {
     }
 
     case 'ADD_DISTRIBUTED_LOAD': {
-      const { lcId, beamId, qx, qy, qxEnd, qyEnd, startT, endT, coordSystem } = action.payload;
+      const { lcId, beamId, qx, qy, qxEnd, qyEnd, startT, endT, coordSystem, description } = action.payload;
       const newLoadCases = state.loadCases.map(lc => {
         if (lc.id !== lcId) return lc;
-        const filtered = lc.distributedLoads.filter(dl => dl.elementId !== beamId);
-        if (qx !== 0 || qy !== 0 || (qxEnd !== undefined && qxEnd !== 0) || (qyEnd !== undefined && qyEnd !== 0)) {
-          filtered.push({ elementId: beamId, qx, qy, qxEnd, qyEnd, startT, endT, coordSystem });
+        if (qx === 0 && qy === 0 && (qxEnd === undefined || qxEnd === 0) && (qyEnd === undefined || qyEnd === 0)) {
+          return lc; // Don't add zero loads
         }
-        return { ...lc, distributedLoads: filtered };
+        // Auto-generate a unique id for the new load
+        const maxId = lc.distributedLoads.reduce((max, dl) => Math.max(max, dl.id ?? 0), 0);
+        const newLoad = { id: maxId + 1, elementId: beamId, qx, qy, qxEnd, qyEnd, startT, endT, coordSystem, description };
+        return { ...lc, distributedLoads: [...lc.distributedLoads, newLoad] };
+      });
+      return { ...state, loadCases: newLoadCases };
+    }
+
+    case 'UPDATE_DISTRIBUTED_LOAD': {
+      const { lcId, loadId, qx, qy, qxEnd, qyEnd, startT, endT, coordSystem, description } = action.payload;
+      const newLoadCases = state.loadCases.map(lc => {
+        if (lc.id !== lcId) return lc;
+        const updatedLoads = lc.distributedLoads.map(dl => {
+          if (dl.id !== loadId) return dl;
+          // If all values are zero, keep the load but with zero values (use REMOVE to delete)
+          return { ...dl, qx, qy, qxEnd, qyEnd, startT, endT, coordSystem, description };
+        });
+        return { ...lc, distributedLoads: updatedLoads };
       });
       return { ...state, loadCases: newLoadCases };
     }
@@ -707,10 +809,10 @@ function femReducer(state: FEMState, action: FEMAction): FEMState {
     }
 
     case 'REMOVE_DISTRIBUTED_LOAD': {
-      const { lcId, beamId } = action.payload;
+      const { lcId, loadId } = action.payload;
       const newLoadCases = state.loadCases.map(lc => {
         if (lc.id !== lcId) return lc;
-        return { ...lc, distributedLoads: lc.distributedLoads.filter(dl => dl.elementId !== beamId) };
+        return { ...lc, distributedLoads: lc.distributedLoads.filter(dl => dl.id !== loadId) };
       });
       return { ...state, loadCases: newLoadCases };
     }
@@ -783,6 +885,8 @@ function femReducer(state: FEMState, action: FEMAction): FEMState {
 
     case 'LOAD_PROJECT': {
       const { mesh, loadCases, loadCombinations, projectInfo, structuralGrid } = action.payload;
+      // Migrate: ensure all distributed loads have IDs (backward compat with old projects)
+      migrateDistributedLoadIds(loadCases);
       return {
         ...state,
         mesh,
@@ -837,6 +941,12 @@ function femReducer(state: FEMState, action: FEMAction): FEMState {
     case 'SET_SHOW_ENVELOPE':
       return { ...state, showEnvelope: action.payload };
 
+    case 'SET_ENVELOPE_RESULT':
+      return { ...state, envelopeResult: action.payload };
+
+    case 'SET_SHOW_DEFLECTIONS':
+      return { ...state, showDeflections: action.payload };
+
     case 'SET_CODE_CHECK_BEAM':
       return { ...state, codeCheckBeamId: action.payload };
 
@@ -852,6 +962,123 @@ function femReducer(state: FEMState, action: FEMAction): FEMState {
       }));
       return { ...state, loadCases: cleanedLoadCases };
     }
+
+    case 'COPY_SELECTED': {
+      const selectedNodeIds = state.selection.nodeIds;
+      const selectedElementIds = state.selection.elementIds;
+      if (selectedNodeIds.size === 0 && selectedElementIds.size === 0) return state;
+
+      // Collect selected nodes
+      const copiedNodes: INode[] = [];
+      for (const nodeId of selectedNodeIds) {
+        const node = state.mesh.getNode(nodeId);
+        if (node) copiedNodes.push({ ...node });
+      }
+
+      // Collect beam elements where BOTH nodes are in the selection,
+      // or elements that are explicitly selected and have both nodes selected
+      const copiedBeams: IBeamElement[] = [];
+      const copiedNodeIdSet = new Set(copiedNodes.map(n => n.id));
+
+      // First: include explicitly selected beam elements if both nodes are selected
+      for (const elemId of selectedElementIds) {
+        const beam = state.mesh.getBeamElement(elemId);
+        if (beam && copiedNodeIdSet.has(beam.nodeIds[0]) && copiedNodeIdSet.has(beam.nodeIds[1])) {
+          copiedBeams.push({ ...beam });
+        }
+      }
+
+      // Second: find any beam elements where both nodes are in the selection (implicit)
+      for (const beam of state.mesh.beamElements.values()) {
+        if (copiedNodeIdSet.has(beam.nodeIds[0]) && copiedNodeIdSet.has(beam.nodeIds[1])) {
+          // Avoid duplicates
+          if (!copiedBeams.find(b => b.id === beam.id)) {
+            copiedBeams.push({ ...beam });
+          }
+        }
+      }
+
+      return {
+        ...state,
+        clipboard: { nodes: copiedNodes, beamElements: copiedBeams }
+      };
+    }
+
+    case 'PASTE': {
+      if (!state.clipboard || state.clipboard.nodes.length === 0) return state;
+
+      const offsetX = action.payload?.offsetX ?? 1;
+      const offsetY = action.payload?.offsetY ?? 1;
+
+      // Push undo before modifying
+      const meshSnapshot = JSON.stringify(state.mesh.toJSON());
+      const lcSnapshot = JSON.stringify(serializeLoadCases(state.loadCases));
+      const snapshot = JSON.stringify({ mesh: meshSnapshot, loadCases: lcSnapshot });
+      const newUndoStack = [...state.undoStack, snapshot];
+      if (newUndoStack.length > 50) newUndoStack.shift();
+
+      // Mapping from old node ID to new node ID
+      const nodeIdMap = new Map<number, number>();
+      const newNodeIds = new Set<number>();
+      const newElementIds = new Set<number>();
+
+      // Create new nodes at offset positions
+      for (const clipNode of state.clipboard.nodes) {
+        const newNode = state.mesh.addNode(clipNode.x + offsetX, clipNode.y + offsetY);
+        nodeIdMap.set(clipNode.id, newNode.id);
+        newNodeIds.add(newNode.id);
+
+        // Copy constraints from the original node
+        state.mesh.updateNode(newNode.id, {
+          constraints: { ...clipNode.constraints }
+        });
+      }
+
+      // Create new beam elements with mapped node IDs
+      for (const clipBeam of state.clipboard.beamElements) {
+        const newNodeId0 = nodeIdMap.get(clipBeam.nodeIds[0]);
+        const newNodeId1 = nodeIdMap.get(clipBeam.nodeIds[1]);
+        if (newNodeId0 !== undefined && newNodeId1 !== undefined) {
+          const newBeam = state.mesh.addBeamElement(
+            [newNodeId0, newNodeId1],
+            clipBeam.materialId,
+            { ...clipBeam.section },
+            clipBeam.profileName
+          );
+          if (newBeam) {
+            newElementIds.add(newBeam.id);
+            // Copy end releases if present
+            if (clipBeam.endReleases) {
+              state.mesh.updateBeamElement(newBeam.id, {
+                endReleases: { ...clipBeam.endReleases }
+              });
+            }
+          }
+        }
+      }
+
+      return {
+        ...state,
+        selection: {
+          nodeIds: newNodeIds,
+          elementIds: newElementIds,
+          pointLoadNodeIds: new Set(),
+          distLoadBeamIds: new Set(),
+          selectedDistLoadIds: new Set(),
+          plateIds: new Set()
+        },
+        undoStack: newUndoStack,
+        redoStack: [],
+        meshVersion: state.meshVersion + 1,
+        result: null
+      };
+    }
+
+    case 'SET_MOUSE_WORLD_POS':
+      return { ...state, mouseWorldPos: action.payload };
+
+    case 'SET_CANVAS_SIZE':
+      return { ...state, canvasSize: action.payload };
 
     default:
       return state;

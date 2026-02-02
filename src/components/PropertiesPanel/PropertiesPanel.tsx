@@ -65,26 +65,34 @@ export function PropertiesPanel() {
           <h3>Node #{selectedNode.id}</h3>
           <div className="form-row">
             <div className="form-group">
-              <label>X (m)</label>
+              <label>X: {selectedNode.x.toFixed(3)} m</label>
               <input
                 type="number"
-                value={selectedNode.x}
-                step="0.5"
+                value={parseFloat(selectedNode.x.toFixed(3))}
+                step="0.001"
+                min="-1000"
                 onChange={(e) => {
-                  mesh.updateNode(selectedNode.id, { x: parseFloat(e.target.value) || 0 });
-                  dispatch({ type: 'REFRESH_MESH' });
+                  const val = parseFloat(e.target.value);
+                  if (!isNaN(val)) {
+                    mesh.updateNode(selectedNode.id, { x: Math.round(val * 1000) / 1000 });
+                    dispatch({ type: 'REFRESH_MESH' });
+                  }
                 }}
               />
             </div>
             <div className="form-group">
-              <label>Y (m)</label>
+              <label>Y: {selectedNode.y.toFixed(3)} m</label>
               <input
                 type="number"
-                value={selectedNode.y}
-                step="0.5"
+                value={parseFloat(selectedNode.y.toFixed(3))}
+                step="0.001"
+                min="-1000"
                 onChange={(e) => {
-                  mesh.updateNode(selectedNode.id, { y: parseFloat(e.target.value) || 0 });
-                  dispatch({ type: 'REFRESH_MESH' });
+                  const val = parseFloat(e.target.value);
+                  if (!isNaN(val)) {
+                    mesh.updateNode(selectedNode.id, { y: Math.round(val * 1000) / 1000 });
+                    dispatch({ type: 'REFRESH_MESH' });
+                  }
                 }}
               />
             </div>
@@ -220,6 +228,18 @@ export function PropertiesPanel() {
             </select>
           </div>
 
+          {/* Material properties */}
+          {(() => {
+            const mat = mesh.getMaterial(selectedBeam.materialId);
+            if (!mat) return null;
+            return (
+              <div className="result-info">
+                <p><strong>E:</strong> {(mat.E / 1e9).toFixed(1)} GPa</p>
+                <p><strong>&nu;:</strong> {mat.nu.toFixed(2)}</p>
+              </div>
+            );
+          })()}
+
           <div className="form-group">
             <label>Section Profile</label>
             <select
@@ -236,6 +256,18 @@ export function PropertiesPanel() {
                 <option key={s.name} value={s.section.A.toExponential(2)}>{s.name}</option>
               ))}
             </select>
+          </div>
+
+          {/* Extended section properties */}
+          {selectedBeam.profileName && (
+            <p style={{ fontSize: '11px', color: 'var(--text-secondary)' }}><strong>Profile:</strong> {selectedBeam.profileName}</p>
+          )}
+          <div className="result-info">
+            <p><strong>A:</strong> {selectedBeam.section.A.toExponential(3)} m²</p>
+            <p><strong>Iy:</strong> {(selectedBeam.section.Iy ?? selectedBeam.section.I).toExponential(3)} m⁴</p>
+            {selectedBeam.section.Iz != null && <p><strong>Iz:</strong> {selectedBeam.section.Iz.toExponential(3)} m⁴</p>}
+            {selectedBeam.section.Wy != null && <p><strong>Wy:</strong> {selectedBeam.section.Wy.toExponential(3)} m³</p>}
+            {selectedBeam.section.Wz != null && <p><strong>Wz:</strong> {selectedBeam.section.Wz.toExponential(3)} m³</p>}
           </div>
 
           <h4>Distributed Load (kN/m)</h4>
@@ -419,6 +451,9 @@ export function PropertiesPanel() {
                       <option value="sigmaX">sigma_x</option>
                       <option value="sigmaY">sigma_y</option>
                       <option value="tauXY">tau_xy</option>
+                      <option value="nx">Membrane Force Nx (kN/m)</option>
+                      <option value="ny">Membrane Force Ny (kN/m)</option>
+                      <option value="nxy">Membrane Force Nxy (kN/m)</option>
                     </>
                   )}
                 </select>

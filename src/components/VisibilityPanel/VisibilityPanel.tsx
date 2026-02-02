@@ -15,6 +15,7 @@ export function VisibilityPanel({ collapsed, onToggleCollapse }: VisibilityPanel
     showMoment,
     showShear,
     showNormal,
+    showDeflections,
     diagramScale,
     result,
     analysisType,
@@ -261,50 +262,29 @@ export function VisibilityPanel({ collapsed, onToggleCollapse }: VisibilityPanel
               </label>
             </div>
 
-            {analysisType === 'frame' && (
-              <>
-                <div className="subsection-title">Diagrams</div>
-                <div className="diagram-options">
-                  <label className="toggle-label">
-                    <input
-                      type="checkbox"
-                      checked={showMoment}
-                      onChange={(e) => dispatch({ type: 'SET_SHOW_MOMENT', payload: e.target.checked })}
-                    />
-                    <span className="toggle-text" style={{ color: '#ef4444' }}>Bending Moment (M)</span>
-                  </label>
-                  <label className="toggle-label">
-                    <input
-                      type="checkbox"
-                      checked={showShear}
-                      onChange={(e) => dispatch({ type: 'SET_SHOW_SHEAR', payload: e.target.checked })}
-                    />
-                    <span className="toggle-text" style={{ color: '#3b82f6' }}>Shear Force (V)</span>
-                  </label>
-                  <label className="toggle-label">
-                    <input
-                      type="checkbox"
-                      checked={showNormal}
-                      onChange={(e) => dispatch({ type: 'SET_SHOW_NORMAL', payload: e.target.checked })}
-                    />
-                    <span className="toggle-text" style={{ color: '#22c55e' }}>Normal Force (N)</span>
-                  </label>
-                </div>
+            <div className="toggle-row">
+              <label className="toggle-label">
+                <input
+                  type="checkbox"
+                  checked={state.showDisplacements}
+                  onChange={(e) => dispatch({ type: 'SET_SHOW_DISPLACEMENTS', payload: e.target.checked })}
+                />
+                <span className="toggle-text">Displacements</span>
+              </label>
+            </div>
 
-                {(showMoment || showShear || showNormal) && (
-                  <div className="slider-row">
-                    <span className="slider-label">Diagram Scale</span>
-                    <input
-                      type="range"
-                      min="10"
-                      max="200"
-                      value={diagramScale}
-                      onChange={(e) => dispatch({ type: 'SET_DIAGRAM_SCALE', payload: parseInt(e.target.value) })}
-                    />
-                    <span className="slider-value">{diagramScale}</span>
-                  </div>
-                )}
-              </>
+            {analysisType === 'frame' && (showMoment || showShear || showNormal || showDeflections) && (
+              <div className="slider-row">
+                <span className="slider-label">Diagram Scale</span>
+                <input
+                  type="range"
+                  min="10"
+                  max="200"
+                  value={diagramScale}
+                  onChange={(e) => dispatch({ type: 'SET_DIAGRAM_SCALE', payload: parseInt(e.target.value) })}
+                />
+                <span className="slider-value">{diagramScale}</span>
+              </div>
             )}
           </div>
         )}

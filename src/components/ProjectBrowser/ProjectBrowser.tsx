@@ -20,7 +20,7 @@ interface ProjectBrowserProps {
 
 export function ProjectBrowser({ collapsed, onToggleCollapse }: ProjectBrowserProps) {
   const { state, dispatch, pushUndo } = useFEM();
-  const { mesh, selection, result, showMoment, showShear, showNormal, showDeformed, showReactions, loadCases, activeLoadCase } = state;
+  const { mesh, selection, result, showMoment, showShear, showNormal, showDeflections, showDeformed, showReactions, loadCases, activeLoadCase } = state;
 
   const [activeTab, setActiveTab] = useState<BrowserTab>('project');
 
@@ -59,16 +59,19 @@ export function ProjectBrowser({ collapsed, onToggleCollapse }: ProjectBrowserPr
     });
   };
 
-  const activateResultView = (opts: { moment?: boolean; shear?: boolean; normal?: boolean; deformed?: boolean; reactions?: boolean }) => {
+  const activateResultView = (opts: { moment?: boolean; shear?: boolean; normal?: boolean; deflections?: boolean; deformed?: boolean; reactions?: boolean }) => {
     dispatch({ type: 'SET_VIEW_MODE', payload: 'results' });
     if (opts.moment !== undefined) dispatch({ type: 'SET_SHOW_MOMENT', payload: opts.moment });
     if (opts.shear !== undefined) dispatch({ type: 'SET_SHOW_SHEAR', payload: opts.shear });
     if (opts.normal !== undefined) dispatch({ type: 'SET_SHOW_NORMAL', payload: opts.normal });
+    if (opts.deflections !== undefined) dispatch({ type: 'SET_SHOW_DEFLECTIONS', payload: opts.deflections });
     if (opts.deformed !== undefined) dispatch({ type: 'SET_SHOW_DEFORMED', payload: opts.deformed });
     if (opts.reactions !== undefined) dispatch({ type: 'SET_SHOW_REACTIONS', payload: opts.reactions });
   };
 
   const nodes = Array.from(mesh.nodes.values());
+  const structuralNodes = nodes.filter(n => n.id < 1000);
+  const plateNodes = nodes.filter(n => n.id >= 1000);
   const beams = Array.from(mesh.beamElements.values());
   const materials = Array.from(mesh.materials.values());
   const supportedNodes = nodes.filter(n => n.constraints.x || n.constraints.y || n.constraints.rotation);
@@ -80,6 +83,7 @@ export function ProjectBrowser({ collapsed, onToggleCollapse }: ProjectBrowserPr
       case 'moment': return showMoment;
       case 'shear': return showShear;
       case 'normal': return showNormal;
+      case 'deflections': return showDeflections;
       case 'reactions': return showReactions;
       case 'displacement': return showDeformed;
       default: return false;
@@ -176,11 +180,11 @@ export function ProjectBrowser({ collapsed, onToggleCollapse }: ProjectBrowserPr
                     <span className={`tree-arrow ${expanded.nodes ? 'expanded' : ''}`}><ChevronRight size={12} /></span>
                     <span className="tree-icon"><CircleDot size={14} /></span>
                     <span className="tree-label">Nodes</span>
-                    <span className="tree-count">{nodes.length}</span>
+                    <span className="tree-count">{structuralNodes.length}</span>
                   </div>
                   {expanded.nodes && (
                     <div className="tree-children">
-                      {nodes.map(node => (
+                      {structuralNodes.map(node => (
                         <div
                           key={node.id}
                           className={`tree-item leaf ${selection.nodeIds.has(node.id) ? 'selected' : ''}`}
@@ -193,6 +197,33 @@ export function ProjectBrowser({ collapsed, onToggleCollapse }: ProjectBrowserPr
                         </div>
                       ))}
                     </div>
+                  )}
+
+                  {/* Plate Nodes */}
+                  {plateNodes.length > 0 && (
+                    <>
+                      <div className="tree-item" onClick={() => toggleExpand('plateNodes' as keyof typeof expanded)}>
+                        <span className={`tree-arrow ${(expanded as Record<string, boolean>)['plateNodes'] ? 'expanded' : ''}`}><ChevronRight size={12} /></span>
+                        <span className="tree-icon" style={{ color: '#8b949e' }}><CircleDot size={14} /></span>
+                        <span className="tree-label" style={{ color: '#8b949e' }}>Plate Nodes</span>
+                        <span className="tree-count">{plateNodes.length}</span>
+                      </div>
+                      {(expanded as Record<string, boolean>)['plateNodes'] && (
+                        <div className="tree-children">
+                          {plateNodes.map(node => (
+                            <div
+                              key={node.id}
+                              className={`tree-item leaf ${selection.nodeIds.has(node.id) ? 'selected' : ''}`}
+                              onClick={() => selectNode(node.id)}
+                            >
+                              <span className="tree-icon small" style={{ color: '#8b949e' }}><Circle size={8} /></span>
+                              <span className="tree-label" style={{ color: '#8b949e' }}>Node {node.id}</span>
+                              <span className="tree-info">X:{(node.x * 1000).toFixed(0)} Z:{(node.y * 1000).toFixed(0)}</span>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </>
                   )}
 
                   {/* Members */}
@@ -413,6 +444,13 @@ export function ProjectBrowser({ collapsed, onToggleCollapse }: ProjectBrowserPr
                         <span className="tree-icon small" style={{ color: '#22c55e' }}><TrendingUp size={10} /></span>
                         <span className="tree-label">Normal Force (N)</span>
                       </div>
+                      <div
+                        className={`tree-item leaf result-option ${isResultActive('deflections') ? 'active-result' : ''}`}
+                        onClick={() => activateResultView({ deflections: !showDeflections })}
+                      >
+                        <span className="tree-icon small" style={{ color: '#8b5cf6' }}><Move size={10} /></span>
+                        <span className="tree-label">Deflections (\u03B4)</span>
+                      </div>
                     </div>
                   )}
                 </div>
@@ -493,10 +531,14 @@ export function ProjectBrowser({ collapsed, onToggleCollapse }: ProjectBrowserPr
         const nodes = mesh.getBeamElementNodes(beam);
         if (!nodes) return null;
         const length = calculateBeamLength(nodes[0], nodes[1]);
+        const beamMaterial = mesh.getMaterial(beam.materialId);
+        const editBarForces = result?.beamForces.get(editingBarId);
         return (
           <BarPropertiesDialog
             beam={beam}
             length={length}
+            material={beamMaterial}
+            beamForces={editBarForces}
             onUpdate={(updates) => {
               pushUndo();
               mesh.updateBeamElement(editingBarId, updates);
